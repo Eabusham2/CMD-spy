@@ -1,0 +1,35 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build:
+    name: Build (Windows / .NET 8)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore CmdSpy.sln
+
+      - name: Build (Release)
+        run: dotnet build CmdSpy.sln -c Release --no-restore
+
+      - name: Publish app
+        run: dotnet publish src/CmdSpy.App/CmdSpy.App.csproj -c Release -o publish/CmdSpy --no-build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmdspy-windows
+          path: publish/
