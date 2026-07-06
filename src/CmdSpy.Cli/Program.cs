@@ -11,7 +11,7 @@ namespace CmdSpy.Cli;
 /// task when you only care about the log file, not the GUI.
 ///
 /// Usage:
-///   cmdspy [--extended] [--no-network] [--no-children] [--log-dir &lt;path&gt;]
+///   cmdspy [--cmd-only] [--no-network] [--no-children] [--log-dir &lt;path&gt;]
 /// </summary>
 internal static class Program
 {
@@ -25,11 +25,12 @@ internal static class Program
 
         var options = new CmdSpyOptions();
 
-        if (HasFlag(args, "--extended"))
+        // By default every console/terminal/script host is watched. --cmd-only
+        // narrows that to just cmd.exe.
+        if (HasFlag(args, "--cmd-only"))
         {
             options.TargetProcessNames.Clear();
-            foreach (var t in CmdSpyOptions.ExtendedTargets)
-                options.TargetProcessNames.Add(t);
+            options.TargetProcessNames.Add("cmd.exe");
         }
         if (HasFlag(args, "--no-network")) options.CaptureNetwork = false;
         if (HasFlag(args, "--no-children")) options.CaptureChildren = false;
@@ -107,8 +108,12 @@ internal static class Program
             Usage:
               cmdspy [options]
 
+            By default CMD-spy watches every known console, terminal and script
+            host: cmd, powershell, pwsh, conhost, wscript, cscript, mshta,
+            wt, WindowsTerminal, OpenConsole.
+
             Options:
-              --extended       Watch cmd, powershell, pwsh, conhost, wscript, cscript, mshta
+              --cmd-only       Watch only cmd.exe (narrows the default set)
               --no-network     Do not snapshot network connections
               --no-children    Do not record child processes (actions)
               --log-dir <dir>  Override the log directory

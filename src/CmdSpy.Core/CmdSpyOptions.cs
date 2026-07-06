@@ -10,10 +10,11 @@ public sealed class CmdSpyOptions
 {
     /// <summary>
     /// Executable names that count as a "cmd popup". Compared case-insensitively
-    /// and with/without the ".exe" suffix. Defaults to cmd.exe only.
+    /// and with/without the ".exe" suffix. Defaults to every known console,
+    /// terminal and script host (see <see cref="ExtendedTargets"/>).
     /// </summary>
     public HashSet<string> TargetProcessNames { get; set; } =
-        new(StringComparer.OrdinalIgnoreCase) { "cmd.exe" };
+        new(ExtendedTargets, StringComparer.OrdinalIgnoreCase);
 
     public bool CaptureNetwork { get; set; } = true;
     public bool CaptureChildren { get; set; } = true;
@@ -30,13 +31,16 @@ public sealed class CmdSpyOptions
         "CmdSpy", "logs");
 
     /// <summary>
-    /// Console-host and script-host executables that commonly produce a flashing
-    /// window. Useful when the user wants broader coverage than cmd.exe alone.
+    /// Every console-host, terminal and script-host executable CMD-spy knows how
+    /// to watch — anything that can produce a flashing command window. This is
+    /// the default target set. Includes the Windows Terminal app
+    /// (wt / WindowsTerminal / OpenConsole).
     /// </summary>
     public static IReadOnlyCollection<string> ExtendedTargets { get; } = new[]
     {
         "cmd.exe", "powershell.exe", "pwsh.exe", "conhost.exe",
-        "wscript.exe", "cscript.exe", "mshta.exe"
+        "wscript.exe", "cscript.exe", "mshta.exe",
+        "wt.exe", "WindowsTerminal.exe", "OpenConsole.exe"
     };
 
     /// <summary>Returns the configured targets reduced to lower-case stems (no extension).</summary>

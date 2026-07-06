@@ -1,10 +1,16 @@
 # CMD-spy
 
+[![build](https://github.com/Eabusham2/CMD-spy/actions/workflows/build.yml/badge.svg)](https://github.com/Eabusham2/CMD-spy/actions/workflows/build.yml)
+
 **Catch every Command Prompt window — even the ones that flash for a millisecond — and log everything about them.**
 
 Some programs (installers, scripts, scheduled tasks, and occasionally malware)
 spawn a `cmd.exe` window that appears and disappears too fast to read. CMD-spy
-watches for those popups in real time and records, for each one:
+watches for those popups in real time. By default it watches **every known
+console, terminal and script host** — `cmd.exe`, `powershell.exe`, `pwsh.exe`,
+`conhost.exe`, `wscript.exe`, `cscript.exe`, `mshta.exe`, and the Windows
+Terminal app (`wt.exe`, `WindowsTerminal.exe`, `OpenConsole.exe`) — and records,
+for each one:
 
 - **Task info** — process name, PID, image path, user and session
 - **Command line** — the full command that ran inside the window
@@ -100,9 +106,11 @@ and shows a live table of captured popups. Select a row to see the full details
 (command line, cause, actions, networking, timing). Toolbar:
 
 - **Start / Stop** monitoring
-- **Targets ▾** — choose which hosts count as a "popup" (default `cmd.exe`; you
-  can also enable `powershell.exe`, `pwsh.exe`, `conhost.exe`, `wscript.exe`,
-  `cscript.exe`, `mshta.exe`), and toggle network / child-process capture
+- **Targets ▾** — every console/terminal/script host is watched by default
+  (`cmd.exe`, `powershell.exe`, `pwsh.exe`, `conhost.exe`, `wscript.exe`,
+  `cscript.exe`, `mshta.exe`, `wt.exe`, `WindowsTerminal.exe`,
+  `OpenConsole.exe`); untick any you don't want, and toggle network /
+  child-process capture
 - **Filter** — live substring search over command line, process, parent and user
 - **Open log folder** / **Export…** (text report or JSON lines)
 - Status bar shows monitoring source, event count, boot time and live uptime
@@ -112,12 +120,14 @@ and shows a live table of captured popups. Select a row to see the full details
 Useful for a background or scheduled task when you only need the log files:
 
 ```powershell
-cmdspy [--extended] [--no-network] [--no-children] [--log-dir <path>]
+cmdspy [--cmd-only] [--no-network] [--no-children] [--log-dir <path>]
 ```
+
+By default every known console/terminal/script host is watched (same set as the GUI).
 
 | Option          | Effect                                                            |
 |-----------------|-------------------------------------------------------------------|
-| `--extended`    | Watch cmd, powershell, pwsh, conhost, wscript, cscript, mshta      |
+| `--cmd-only`    | Watch only `cmd.exe` (narrows the default all-hosts set)          |
 | `--no-network`  | Skip the network-connection snapshot                              |
 | `--no-children` | Don't record child processes (actions)                           |
 | `--log-dir`     | Override the log directory                                        |
