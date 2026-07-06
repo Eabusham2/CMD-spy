@@ -98,9 +98,11 @@ dotnet build CmdSpy.sln -c Release -p:EnableWindowsTargeting=true
 src\CmdSpy.App\bin\Release\net8.0-windows\CmdSpy.exe
 ```
 
-The app requests elevation via its manifest. It starts monitoring automatically
-and shows a live table of captured popups. Select a row to see the full details
-(command line, cause, actions, networking, timing). Toolbar:
+The app **runs elevated**: its manifest requests Administrator, and if it is ever
+launched without elevation (for example via `dotnet CmdSpy.dll`, which ignores
+the exe manifest) it re-launches itself with a UAC prompt. It starts monitoring
+automatically and shows a live table of captured popups. Select a row to see the
+full details (command line, cause, actions, networking, timing). Toolbar:
 
 - **Start / Stop** monitoring
 - **Targets ▾** — every console/terminal/script host is watched by default
