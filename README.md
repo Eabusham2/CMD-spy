@@ -57,11 +57,10 @@ src/
     Models/           CmdEvent, ProcessInfo, NetworkConnectionInfo
     Monitoring/       ETW + WMI watchers, network inspector, boot-time helper
     Logging/          EventStore (JSON-lines + human-readable .log)
-    Formatting/       Text renderer shared by the log, GUI and CLI
+    Formatting/       Text renderer shared by the log and GUI
     CmdSpyEngine.cs   Orchestrator: detect -> filter -> enrich -> store
     CmdSpyOptions.cs  Configuration (targets, network, log directory, ...)
   CmdSpy.App/         WinForms GUI dashboard  (build output: CmdSpy.exe)
-  CmdSpy.Cli/         Headless console logger (build output: cmdspy.exe)
 ```
 
 ---
@@ -94,8 +93,6 @@ dotnet build CmdSpy.sln -c Release -p:EnableWindowsTargeting=true
 
 ## Running
 
-### GUI
-
 ```powershell
 # Right-click -> "Run as administrator" for full ETW fidelity
 src\CmdSpy.App\bin\Release\net8.0-windows\CmdSpy.exe
@@ -115,29 +112,11 @@ and shows a live table of captured popups. Select a row to see the full details
 - **Open log folder** / **Export…** (text report or JSON lines)
 - Status bar shows monitoring source, event count, boot time and live uptime
 
-### Headless logger (CLI)
-
-Useful for a background or scheduled task when you only need the log files:
-
-```powershell
-cmdspy [--cmd-only] [--no-network] [--no-children] [--log-dir <path>]
-```
-
-By default every known console/terminal/script host is watched (same set as the GUI).
-
-| Option          | Effect                                                            |
-|-----------------|-------------------------------------------------------------------|
-| `--cmd-only`    | Watch only `cmd.exe` (narrows the default all-hosts set)          |
-| `--no-network`  | Skip the network-connection snapshot                              |
-| `--no-children` | Don't record child processes (actions)                           |
-| `--log-dir`     | Override the log directory                                        |
-| `-h`, `--help`  | Show help                                                        |
-
 ---
 
 ## Where the logs go
 
-By default, both the GUI and CLI write to:
+By default, CMD-spy writes to:
 
 ```
 %ProgramData%\CmdSpy\logs\
@@ -145,9 +124,11 @@ By default, both the GUI and CLI write to:
     cmdspy-YYYYMMDD.log     formatted, human-readable blocks
 ```
 
-Files roll by date. The `.jsonl` file records a full object when a popup is first
-captured, then compact *delta* lines as it gains detail (a child process, a new
-connection, or its exit + lifetime).
+Files roll by date. The `.jsonl` file writes a full object when a popup is first
+captured, then re-writes the full object each time it gains detail (a child
+process, a new connection, or its exit + lifetime). Keep the **last line per
+event `id`** to get the complete, final record. The `.log` file gets a block when
+the popup is first seen and a finalized block when it exits.
 
 ### Example `.log` entry
 

@@ -51,7 +51,7 @@ public sealed class WmiProcessWatcher : IProcessWatcher
                 ProcessName = name,
                 ImagePath = null,
                 CommandLine = null,
-                TimestampUtc = DateTimeOffset.UtcNow,
+                TimestampUtc = EventTime(ev),
                 Source = "WMI"
             });
         }
@@ -74,7 +74,7 @@ public sealed class WmiProcessWatcher : IProcessWatcher
             {
                 ProcessId = pid,
                 ExitCode = exit,
-                TimestampUtc = DateTimeOffset.UtcNow
+                TimestampUtc = EventTime(ev)
             });
         }
         catch
@@ -84,6 +84,32 @@ public sealed class WmiProcessWatcher : IProcessWatcher
     }
 
     private static int ToInt(object? value) => value is null ? 0 : Convert.ToInt32(value);
+
+    /// <summary>
+    /// Reads the event's TIME_CREATED (a FILETIME stamped by WMI when the
+    /// underlying process event fired) so timestamps reflect when the process
+    /// actually started/stopped rather than when our handler happened to run —
+    /// important for the short-lived processes this tool targets. Falls back to
+    /// the current time if the value is missing or malformed.
+    /// </summary>
+    private static DateTimeOffset EventTime(ManagementBaseObject ev)
+    {
+        try
+        {
+            var raw = ev["TIME_CREATED"];
+            if (raw is not null)
+            {
+                ulong fileTime = Convert.ToUInt64(raw);
+                if (fileTime > 0)
+                    return new DateTimeOffset(DateTime.FromFileTimeUtc((long)fileTime));
+            }
+        }
+        catch
+        {
+            // Missing / out-of-range — fall back below.
+        }
+        return DateTimeOffset.UtcNow;
+    }
 
     public void Stop()
     {

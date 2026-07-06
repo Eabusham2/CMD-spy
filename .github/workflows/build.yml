@@ -25,10 +25,8 @@ jobs:
       - name: Build (Release)
         run: dotnet build CmdSpy.sln -c Release --no-restore
 
-      - name: Publish app + CLI
-        run: |
-          dotnet publish src/CmdSpy.App/CmdSpy.App.csproj -c Release -o publish/CmdSpy --no-build
-          dotnet publish src/CmdSpy.Cli/CmdSpy.Cli.csproj -c Release -o publish/cmdspy --no-build
+      - name: Publish app
+        run: dotnet publish src/CmdSpy.App/CmdSpy.App.csproj -c Release -o publish/CmdSpy --no-build
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4

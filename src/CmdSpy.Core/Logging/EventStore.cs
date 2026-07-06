@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -10,11 +11,15 @@ using CmdSpy.Core.Models;
 namespace CmdSpy.Core.Logging;
 
 /// <summary>
-/// Persists captured events. Every sighting is written twice:
-///   * as a single JSON line to <c>cmdspy-YYYYMMDD.jsonl</c> (machine-readable), and
-///   * as a formatted block to <c>cmdspy-YYYYMMDD.log</c> (human-readable),
-/// both rolled by date. Writes are serialized so background watcher threads can
-/// call in without corrupting the files.
+/// Persists captured events to date-rolled files:
+///   * <c>cmdspy-YYYYMMDD.jsonl</c> — one JSON object per line (machine-readable).
+///     An event is written on creation and again whenever it gains detail (a
+///     child process, a new connection, or its exit), so a reader that keeps the
+///     last line per event id has the complete, final record.
+///   * <c>cmdspy-YYYYMMDD.log</c> — human-readable blocks: one when the popup is
+///     first seen and a finalized block when it exits.
+/// Writes are serialized so background watcher threads can call in without
+/// corrupting the files.
 /// </summary>
 public sealed class EventStore
 {
@@ -61,40 +66,43 @@ public sealed class EventStore
     }
 
     /// <summary>
-    /// Writes a follow-up record once we learn more about an event (the process
-    /// exited, spawned a child, or opened a socket). The JSON line is a compact
-    /// delta so the original record is never rewritten in place.
+    /// Writes an updated snapshot once we learn more about an event (it exited,
+    /// spawned a child, or opened a socket). The full event — including the
+    /// child-process and network lists — is re-serialized, so a reader that keeps
+    /// the last line per event id ends up with the complete, final record rather
+    /// than losing the actions/endpoints captured after creation. On exit we also
+    /// append a finalized block to the human-readable log.
     /// </summary>
     public void AppendUpdate(CmdEvent ev, string reason)
     {
         string json;
+        string? finalText = null;
         lock (ev)
         {
-            var delta = new
-            {
-                update = reason,
-                id = ev.Id,
-                sequence = ev.SequenceNumber,
-                pid = ev.ProcessId,
-                exitedAtUtc = ev.ExitedAtUtc,
-                lifetimeMs = ev.LifetimeMilliseconds,
-                exitCode = ev.ExitCode,
-                childCount = ev.ChildProcesses.Count,
-                networkCount = ev.NetworkConnections.Count
-            };
-            json = JsonSerializer.Serialize(delta, JsonOptions);
+            json = JsonSerializer.Serialize(ev, JsonOptions);
+            if (reason == "exit")
+                finalText = EventTextFormatter.Format(ev, finalized: true);
         }
         lock (_fileLock)
         {
             File.AppendAllText(CurrentJsonlPath, json + Environment.NewLine, Encoding.UTF8);
+            if (finalText is not null)
+                File.AppendAllText(CurrentLogPath, finalText + Environment.NewLine, Encoding.UTF8);
         }
     }
 
-    /// <summary>Reads back today's JSON-lines file (creation records only).</summary>
+    /// <summary>
+    /// Reads back today's JSON-lines file. Each event may appear on several lines
+    /// (creation plus later snapshots); the last line for a given id wins, so the
+    /// returned events carry their final child/network/lifetime detail.
+    /// </summary>
     public IEnumerable<CmdEvent> ReadToday()
     {
         var path = CurrentJsonlPath;
-        if (!File.Exists(path)) yield break;
+        if (!File.Exists(path)) return Array.Empty<CmdEvent>();
+
+        var byId = new Dictionary<Guid, CmdEvent>();
+        var order = new List<Guid>();
 
         foreach (var line in File.ReadLines(path))
         {
@@ -102,16 +110,18 @@ public sealed class EventStore
             CmdEvent? ev = null;
             try
             {
-                using var doc = JsonDocument.Parse(line);
-                // Skip delta/update records — they lack a ProcessName.
-                if (doc.RootElement.TryGetProperty("update", out _)) continue;
                 ev = JsonSerializer.Deserialize<CmdEvent>(line, JsonOptions);
             }
             catch
             {
                 // Ignore corrupt lines.
             }
-            if (ev is not null) yield return ev;
+            // A real event always has a process name; skip anything else.
+            if (ev is null || string.IsNullOrEmpty(ev.ProcessName)) continue;
+            if (!byId.ContainsKey(ev.Id)) order.Add(ev.Id);
+            byId[ev.Id] = ev;
         }
+
+        return order.Select(id => byId[id]).ToList();
     }
 }

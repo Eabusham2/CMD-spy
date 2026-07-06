@@ -6,21 +6,22 @@ namespace CmdSpy.Core.Formatting;
 /// <summary>Renders a <see cref="CmdEvent"/> as a readable text block.</summary>
 public static class EventTextFormatter
 {
-    public static string Format(CmdEvent ev)
+    public static string Format(CmdEvent ev, bool finalized = false)
     {
         // The engine mutates ChildProcesses/NetworkConnections under lock(ev)
         // from watcher threads; take the same lock so our enumeration is safe.
         lock (ev)
         {
-            return FormatLocked(ev);
+            return FormatLocked(ev, finalized);
         }
     }
 
-    private static string FormatLocked(CmdEvent ev)
+    private static string FormatLocked(CmdEvent ev, bool finalized)
     {
+        var title = finalized ? "CMD POPUP — FINAL RECORD" : "CMD POPUP CAPTURED";
         var sb = new StringBuilder();
         sb.AppendLine("============================================================");
-        sb.AppendLine($"#{ev.SequenceNumber}  CMD POPUP CAPTURED   (id {ev.Id})");
+        sb.AppendLine($"#{ev.SequenceNumber}  {title}   (id {ev.Id})");
         sb.AppendLine("============================================================");
 
         sb.AppendLine("-- Time --------------------------------------------------");
