@@ -25,6 +25,9 @@ jobs:
       - name: Build (Release)
         run: dotnet build CmdSpy.sln -c Release --no-restore
 
+      - name: Test
+        run: dotnet test CmdSpy.sln -c Release --no-build --verbosity normal
+
       - name: Publish app
         run: dotnet publish src/CmdSpy.App/CmdSpy.App.csproj -c Release -o publish/CmdSpy --no-build
 
