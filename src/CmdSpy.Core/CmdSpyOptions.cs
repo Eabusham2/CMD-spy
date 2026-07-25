@@ -26,6 +26,14 @@ public sealed class CmdSpyOptions
     /// <summary>Cap on in-memory retained events (the GUI's live list).</summary>
     public int MaxInMemoryEvents { get; set; } = 10_000;
 
+    /// <summary>
+    /// How long a captured popup is tracked for child-process attribution and
+    /// exit/lifetime after it is first seen. Entries older than this that were
+    /// never observed exiting are evicted, so the active-tracking map can't grow
+    /// without bound and a reused PID isn't attributed to a long-gone process.
+    /// </summary>
+    public TimeSpan ActiveTrackingWindow { get; set; } = TimeSpan.FromMinutes(10);
+
     public static string DefaultLogDirectory() => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
         "CmdSpy", "logs");

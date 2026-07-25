@@ -61,6 +61,8 @@ src/
     CmdSpyEngine.cs   Orchestrator: detect -> filter -> enrich -> store
     CmdSpyOptions.cs  Configuration (targets, network, log directory, ...)
   CmdSpy.App/         WinForms GUI dashboard  (build output: CmdSpy.exe)
+tests/
+  CmdSpy.Core.Tests/  xUnit tests for options, logging and formatting
 ```
 
 ---
@@ -79,6 +81,16 @@ dotnet build CmdSpy.sln -c Release
 ```
 
 Or open `CmdSpy.sln` in Visual Studio 2022 and build.
+
+### Tests
+
+```powershell
+dotnet test CmdSpy.sln -c Release
+```
+
+The test project covers the platform-independent logic — target matching, the
+log round trip (including detail captured *after* the initial write) and the
+display formatting. CI runs it on every push.
 
 ### Cross-compiling on Linux/CI
 

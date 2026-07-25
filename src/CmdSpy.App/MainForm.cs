@@ -294,6 +294,7 @@ public sealed class MainForm : Form
     private void OnCaptured(CmdEvent ev)
     {
         _all.Add(ev);
+        TrimToCap();
         if (PassesFilter(ev))
         {
             _view.Add(ev);
@@ -307,6 +308,27 @@ public sealed class MainForm : Form
             }
         }
         UpdateCount();
+    }
+
+    /// <summary>
+    /// Enforces MaxInMemoryEvents by dropping the oldest captures. The on-disk
+    /// logs keep everything; this only bounds what the GUI holds so a long
+    /// monitoring session can't grow until it runs out of memory.
+    /// </summary>
+    private void TrimToCap()
+    {
+        var cap = _engine.Options.MaxInMemoryEvents;
+        if (cap <= 0 || _all.Count <= cap) return;
+
+        var excess = _all.Count - cap;
+        var dropped = _all.GetRange(0, excess);
+        _all.RemoveRange(0, excess);
+
+        foreach (var old in dropped)
+        {
+            var idx = _view.IndexOf(old);
+            if (idx >= 0) _view.RemoveAt(idx);
+        }
     }
 
     private void OnUpdated(CmdEvent ev)

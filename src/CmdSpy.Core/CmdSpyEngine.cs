@@ -29,6 +29,10 @@ public sealed class CmdSpyEngine : IDisposable
     // can attribute children and compute lifetime on exit.
     private readonly ConcurrentDictionary<int, CmdEvent> _active = new();
 
+    // Boot time is fixed for the life of the machine, so resolve it once instead
+    // of recomputing (and re-deriving a slightly different value) per event.
+    private readonly DateTimeOffset _bootTimeLocal = SystemTimings.BootTimeLocal;
+
     public CmdSpyEngine(CmdSpyOptions? options = null)
     {
         _options = options ?? new CmdSpyOptions();
@@ -121,7 +125,7 @@ public sealed class CmdSpyEngine : IDisposable
 
     private void CaptureCmdPopup(ProcessStartedEventArgs e)
     {
-        var boot = SystemTimings.BootTimeLocal;
+        var boot = _bootTimeLocal;
         var uptime = SystemTimings.Uptime;
         var localTime = e.TimestampUtc.ToLocalTime();
 
@@ -174,8 +178,26 @@ public sealed class CmdSpyEngine : IDisposable
             ev.NetworkConnections = NetworkInspector.GetConnectionsForPid(e.ProcessId);
 
         _active[e.ProcessId] = ev;
+        EvictStaleTracking(e.TimestampUtc);
         _store.Append(ev);
         EventCaptured?.Invoke(this, ev);
+    }
+
+    /// <summary>
+    /// Drops tracked popups whose exit we never observed and that are older than
+    /// the configured window. Without this the active map grows for the life of
+    /// the session, and a recycled PID could attach children to a stale event.
+    /// </summary>
+    private void EvictStaleTracking(DateTimeOffset nowUtc)
+    {
+        var window = _options.ActiveTrackingWindow;
+        if (window <= TimeSpan.Zero) return;
+
+        foreach (var pair in _active)
+        {
+            if (nowUtc - pair.Value.TimestampUtc > window)
+                _active.TryRemove(pair.Key, out _);
+        }
     }
 
     private void AttachChild(CmdEvent parentEvent, ProcessStartedEventArgs child)
