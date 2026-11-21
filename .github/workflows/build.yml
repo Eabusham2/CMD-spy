@@ -5,9 +5,12 @@ on:
     branches: ["**"]
   pull_request:
 
+permissions:
+  contents: write   # lets a push to main publish the GitHub Release
+
 jobs:
   build:
-    name: Build (Windows / .NET 8)
+    name: Build, test & release (Windows / .NET 8)
     runs-on: windows-latest
 
     steps:
@@ -19,20 +22,77 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
+      - name: Version
+        id: version
+        shell: pwsh
+        run: |
+          $version = "1.1.${{ github.run_number }}"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Building CMD-spy $version"
+
       - name: Restore
         run: dotnet restore CmdSpy.sln
 
       - name: Build (Release)
-        run: dotnet build CmdSpy.sln -c Release --no-restore
+        run: dotnet build CmdSpy.sln -c Release --no-restore -p:Version=${{ steps.version.outputs.version }}
 
-      - name: Test
-        run: dotnet test CmdSpy.sln -c Release --no-build --verbosity normal
+      # The runner is elevated, so the Windows integration tests run for real:
+      # the ETW stress test (150 windows that exit within milliseconds, each
+      # checked for its full command line and exit), referenced-PID
+      # resolution, a launcher that exits immediately, live network capture
+      # and Authenticode verification.
+      - name: Test (unit + Windows integration)
+        run: dotnet test CmdSpy.sln -c Release --no-build --logger "console;verbosity=detailed" --logger "trx;LogFileName=results.trx" --results-directory TestResults
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: TestResults/
 
       - name: Publish app
         run: dotnet publish src/CmdSpy.App/CmdSpy.App.csproj -c Release -o publish/CmdSpy --no-build
+
+      - name: Publish app (self-contained, no .NET install needed)
+        run: dotnet publish src/CmdSpy.App/CmdSpy.App.csproj -c Release -r win-x64 --self-contained true -o publish/CmdSpy-win-x64 -p:Version=${{ steps.version.outputs.version }}
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path publish/CmdSpy-win-x64/* -DestinationPath "CmdSpy-${{ steps.version.outputs.version }}-win-x64.zip"
+          Get-ChildItem *.zip | Format-Table Name, Length
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: cmdspy-windows
-          path: publish/
+          path: |
+            publish/
+            CmdSpy-*-win-x64.zip
+
+      - name: Publish GitHub Release (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $notes = @"
+          CMD-spy $version — built and tested from commit ${{ github.sha }}.
+
+          **Download:** ``CmdSpy-$version-win-x64.zip`` — extract it to its own folder and run ``CmdSpy.exe`` (it asks for Administrator rights; no .NET install needed).
+
+          Captures every command-prompt / PowerShell / script-host / Windows Terminal window — even ones that exist for a millisecond — and logs its command line, cause, full launch chain, actions, networking and time since boot, then investigates it:
+
+          - **Launch chain**: parent → grandparent → original launcher, kept even after the parent exits; scheduled task behind the launch
+          - **Referenced processes**: PIDs and names inside the command resolved to their executables and vendors
+          - **Command analysis**: plain-language explanation (read-only query vs. makes changes), decoded ``-EncodedCommand`` payloads
+          - **Suspicious indicators**: encoded/hidden commands, download cradles, abused Windows tools, credential theft, ransomware-style backup deletion, security-tool tampering, persistence, masquerading — mapped to MITRE ATT&CK
+          - **Authenticity**: Authenticode signature, publisher and SHA-256 of every program involved
+          - **Windows event history**: Security 4688, Sysmon, PowerShell and Task Scheduler logs; import popups from before CMD-spy was running
+          - **Risk assessment** with its uncertainty spelled out — CMD-spy never declares a computer "clean"
+          - **Boot service**: optional Windows service that captures from boot, before anyone logs in
+          - **Capture self-test** and an ETW stress test in CI that verifies full command lines under rapid exits
+          "@
+          gh release create "v$version" "CmdSpy-$version-win-x64.zip" --title "CMD-spy v$version" --notes $notes --target "${{ github.sha }}"

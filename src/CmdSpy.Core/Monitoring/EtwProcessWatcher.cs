@@ -17,10 +17,29 @@ namespace CmdSpy.Core.Monitoring;
 /// </summary>
 public sealed class EtwProcessWatcher : IProcessWatcher
 {
-    private const string SessionName = "CmdSpy-KernelProcessSession";
+    public const string DefaultSessionName = "CmdSpy-KernelProcessSession";
 
+    private readonly string _sessionName;
     private TraceEventSession? _session;
     private Thread? _pumpThread;
+
+    public EtwProcessWatcher() : this(DefaultSessionName) { }
+
+    /// <param name="sessionName">ETW session name; distinct per host so the GUI and the boot service never collide.</param>
+    public EtwProcessWatcher(string sessionName)
+    {
+        _sessionName = string.IsNullOrWhiteSpace(sessionName) ? DefaultSessionName : sessionName;
+    }
+
+    /// <summary>Events the kernel had to drop because they arrived faster than they were read.</summary>
+    public int EventsLost
+    {
+        get
+        {
+            try { return _session?.EventsLost ?? 0; }
+            catch { return 0; }
+        }
+    }
 
     public string Name => "ETW kernel process trace";
     public bool SupportsCommandLine => true;
@@ -33,7 +52,7 @@ public sealed class EtwProcessWatcher : IProcessWatcher
     {
         // A stale session with the same name may survive a hard crash — recreating
         // with the same name reuses/replaces it cleanly.
-        _session = new TraceEventSession(SessionName)
+        _session = new TraceEventSession(_sessionName)
         {
             StopOnDispose = true
         };
@@ -67,15 +86,41 @@ public sealed class EtwProcessWatcher : IProcessWatcher
         var handler = ProcessStarted;
         if (handler is null) return;
 
+        // Prefer the kernel's full image path (captured at creation, so it is
+        // known even for a process that lives a millisecond), normalised from
+        // \Device\HarddiskVolumeN\... to C:\...
+        string? image = null;
+        try
+        {
+            var kernelPath = data.KernelImageFileName;
+            image = kernelPath is not null && kernelPath.Contains('\\')
+                ? ProcessImageResolver.NormalizeKernelPath(kernelPath)
+                : null;
+        }
+        catch
+        {
+        }
+        if (string.IsNullOrEmpty(image)) image = string.IsNullOrEmpty(data.ImageFileName) ? null : data.ImageFileName;
+
+        int session = -1;
+        try { session = data.SessionID; } catch { }
+
+        // The kernel's short name drops ".exe" and is cut at 15 characters
+        // ("asus_framework."); the file name from the full path is exact.
+        var name = string.IsNullOrEmpty(data.ProcessName) ? data.ImageFileName : data.ProcessName;
+        if (image is not null && image.Contains('\\'))
+            name = image[(image.LastIndexOf('\\') + 1)..];
+
         handler(this, new ProcessStartedEventArgs
         {
             ProcessId = data.ProcessID,
             ParentProcessId = data.ParentID,
-            ProcessName = string.IsNullOrEmpty(data.ProcessName) ? data.ImageFileName : data.ProcessName,
-            ImagePath = string.IsNullOrEmpty(data.ImageFileName) ? null : data.ImageFileName,
+            ProcessName = name,
+            ImagePath = image,
             CommandLine = string.IsNullOrEmpty(data.CommandLine) ? null : data.CommandLine,
             TimestampUtc = data.TimeStamp.ToUniversalTime(),
-            Source = "ETW"
+            Source = "ETW",
+            SessionId = session
         });
     }
 

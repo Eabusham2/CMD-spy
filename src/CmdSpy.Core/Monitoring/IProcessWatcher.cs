@@ -12,6 +12,9 @@ public sealed class ProcessStartedEventArgs : EventArgs
     public string? CommandLine { get; init; }
     public DateTimeOffset TimestampUtc { get; init; }
     public string Source { get; init; } = "";
+
+    /// <summary>Windows session the process started in (-1 if the source doesn't report it).</summary>
+    public int SessionId { get; init; } = -1;
 }
 
 /// <summary>Raised when a process exits — used to measure how long a popup lived.</summary>

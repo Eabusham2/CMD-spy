@@ -9,8 +9,16 @@ namespace CmdSpy.App;
 internal static class Program
 {
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
+        // Started by the Service Control Manager (see ServiceControl): capture
+        // from boot with no window. Services already run as LocalSystem.
+        if (args.Any(a => a.Equals("--service", StringComparison.OrdinalIgnoreCase)))
+        {
+            System.ServiceProcess.ServiceBase.Run(new CmdSpyService());
+            return;
+        }
+
         // CMD-spy needs Administrator rights for ETW / WMI process tracing. The
         // app manifest already requests elevation for the CmdSpy.exe host, but if
         // the app is launched another way (e.g. `dotnet CmdSpy.dll`, which ignores

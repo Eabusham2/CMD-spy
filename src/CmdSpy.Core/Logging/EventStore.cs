@@ -17,9 +17,12 @@ namespace CmdSpy.Core.Logging;
 ///     child process, a new connection, or its exit), so a reader that keeps the
 ///     last line per event id has the complete, final record.
 ///   * <c>cmdspy-YYYYMMDD.log</c> — human-readable blocks: one when the popup is
-///     first seen and a finalized block when it exits.
+///     first seen and a finalized block when it exits (after its investigation
+///     has finished, so the block carries the full analysis).
 /// Writes are serialized so background watcher threads can call in without
-/// corrupting the files.
+/// corrupting the files. Files are opened with shared read/write access, so the
+/// GUI can follow a log that the background service is writing and the files
+/// can be opened in an editor while monitoring runs.
 /// </summary>
 public sealed class EventStore
 {
@@ -60,8 +63,8 @@ public sealed class EventStore
         }
         lock (_fileLock)
         {
-            File.AppendAllText(CurrentJsonlPath, json + Environment.NewLine, Encoding.UTF8);
-            File.AppendAllText(CurrentLogPath, text + Environment.NewLine, Encoding.UTF8);
+            AppendShared(CurrentJsonlPath, json + Environment.NewLine);
+            AppendShared(CurrentLogPath, text + Environment.NewLine);
         }
     }
 
@@ -82,12 +85,53 @@ public sealed class EventStore
             json = JsonSerializer.Serialize(ev, JsonOptions);
             if (reason == "exit")
                 finalText = EventTextFormatter.Format(ev, finalized: true);
+            else if (reason == "reanalysis")
+                finalText = EventTextFormatter.Format(ev, EventTextFormatter.ReanalysisTitle);
         }
         lock (_fileLock)
         {
-            File.AppendAllText(CurrentJsonlPath, json + Environment.NewLine, Encoding.UTF8);
+            AppendShared(CurrentJsonlPath, json + Environment.NewLine);
             if (finalText is not null)
-                File.AppendAllText(CurrentLogPath, finalText + Environment.NewLine, Encoding.UTF8);
+                AppendShared(CurrentLogPath, finalText + Environment.NewLine);
+        }
+    }
+
+    /// <summary>
+    /// Appends UTF-8 text while letting other processes read (and write) the
+    /// file — e.g. the GUI following the service's log. A new file gets a BOM,
+    /// as before, so editors detect the encoding.
+    /// </summary>
+    private static void AppendShared(string path, string text)
+    {
+        using var fs = new FileStream(path, FileMode.Append, FileAccess.Write,
+            FileShare.ReadWrite | FileShare.Delete);
+        if (fs.Length == 0)
+        {
+            var bom = Encoding.UTF8.GetPreamble();
+            fs.Write(bom, 0, bom.Length);
+        }
+        var bytes = Encoding.UTF8.GetBytes(text);
+        fs.Write(bytes, 0, bytes.Length);
+    }
+
+    /// <summary>Opens a log for reading without blocking a writer.</summary>
+    internal static StreamReader OpenShared(string path) =>
+        new(new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete),
+            Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+
+    /// <summary>Parses one JSON-lines record; null for blank, corrupt or non-event lines.</summary>
+    public static CmdEvent? ParseLine(string? line)
+    {
+        if (string.IsNullOrWhiteSpace(line)) return null;
+        try
+        {
+            var ev = JsonSerializer.Deserialize<CmdEvent>(line, JsonOptions);
+            // A real event always has a process name; skip anything else.
+            return ev is null || string.IsNullOrEmpty(ev.ProcessName) ? null : ev;
+        }
+        catch
+        {
+            return null;   // ignore corrupt / half-written lines
         }
     }
 
@@ -104,20 +148,12 @@ public sealed class EventStore
         var byId = new Dictionary<Guid, CmdEvent>();
         var order = new List<Guid>();
 
-        foreach (var line in File.ReadLines(path))
+        using var reader = OpenShared(path);
+        string? line;
+        while ((line = reader.ReadLine()) is not null)
         {
-            if (string.IsNullOrWhiteSpace(line)) continue;
-            CmdEvent? ev = null;
-            try
-            {
-                ev = JsonSerializer.Deserialize<CmdEvent>(line, JsonOptions);
-            }
-            catch
-            {
-                // Ignore corrupt lines.
-            }
-            // A real event always has a process name; skip anything else.
-            if (ev is null || string.IsNullOrEmpty(ev.ProcessName)) continue;
+            var ev = ParseLine(line);
+            if (ev is null) continue;
             if (!byId.ContainsKey(ev.Id)) order.Add(ev.Id);
             byId[ev.Id] = ev;
         }

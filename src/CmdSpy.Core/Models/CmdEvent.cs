@@ -60,6 +60,15 @@ public sealed class CmdEvent
     public string CaptureSource { get; set; } = "";
     public string? Notes { get; set; }
 
+    // ---- Investigation ----------------------------------------------------
+    /// <summary>
+    /// Deep analysis attached shortly after capture: launch chain, referenced
+    /// processes, scheduled task, signatures, command explanation, suspicious
+    /// indicators, Windows event history and the risk assessment. Null until
+    /// the analysis has run.
+    /// </summary>
+    public Investigation? Investigation { get; set; }
+
     // ---- Computed display helpers (not persisted to JSON) ------------------
     [JsonIgnore]
     public string TimeLocalDisplay => TimestampLocal.ToString("yyyy-MM-dd HH:mm:ss.fff");
@@ -87,6 +96,32 @@ public sealed class CmdEvent
     [JsonIgnore]
     public int ChildCount => ChildProcesses.Count;
 
+    /// <summary>Risk verdict for the grid ("…" while the analysis is still running).</summary>
+    [JsonIgnore]
+    public string RiskDisplay
+    {
+        get
+        {
+            var inv = Investigation;
+            if (inv is null) return "…";
+            return inv.Risk?.Level ?? "?";
+        }
+    }
+
+    /// <summary>The original launcher or scheduled task, for the grid.</summary>
+    [JsonIgnore]
+    public string OriginDisplay
+    {
+        get
+        {
+            var inv = Investigation;
+            if (inv is null) return "";
+            if (inv.ScheduledTask is { } task && !string.IsNullOrEmpty(task.TaskPath))
+                return $"Task {task.TaskPath}";
+            return inv.Launcher ?? "";
+        }
+    }
+
     [JsonIgnore]
     public string CommandLineShort
     {
@@ -96,6 +131,21 @@ public sealed class CmdEvent
             c = c.Replace("\r", " ").Replace("\n", " ");
             return c.Length > 160 ? c[..157] + "..." : c;
         }
+    }
+
+    private static readonly System.Reflection.PropertyInfo[] CopyableProperties =
+        typeof(CmdEvent).GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)
+            .Where(p => p.CanRead && p.CanWrite && p.GetIndexParameters().Length == 0)
+            .ToArray();
+
+    /// <summary>
+    /// Overwrites this instance with a newer snapshot of the same event (used when
+    /// following a log written by another process, so the GUI row updates in place).
+    /// </summary>
+    public void CopyFrom(CmdEvent newer)
+    {
+        foreach (var p in CopyableProperties)
+            p.SetValue(this, p.GetValue(newer));
     }
 
     private static string FormatSpan(TimeSpan span)

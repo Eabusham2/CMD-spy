@@ -1,8 +1,9 @@
 namespace CmdSpy.Core.Models;
 
 /// <summary>
-/// A single network endpoint/connection owned by a spied process at the moment
-/// it was captured. Populated best-effort from the Windows IP Helper API.
+/// A single network endpoint/connection owned by a spied process (or one of the
+/// processes it launched). Comes from live ETW kernel network events, plus a
+/// best-effort snapshot of the Windows IP Helper connection table.
 /// </summary>
 public sealed class NetworkConnectionInfo
 {
@@ -13,6 +14,11 @@ public sealed class NetworkConnectionInfo
     public int RemotePort { get; set; }
     public string State { get; set; } = "";          // TCP state, blank for UDP
     public int OwningPid { get; set; }
+
+    /// <summary>"snapshot" (IP Helper connection table) or "ETW" (live kernel network event).</summary>
+    public string? Source { get; set; }
+
+    public System.DateTimeOffset? ObservedAtUtc { get; set; }
 
     public override string ToString()
     {

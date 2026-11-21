@@ -6,9 +6,12 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Windows.Forms;
+using System.Threading.Tasks;
 using CmdSpy.Core;
 using CmdSpy.Core.Formatting;
+using CmdSpy.Core.Logging;
 using CmdSpy.Core.Models;
+using CmdSpy.Core.Monitoring;
 
 namespace CmdSpy.App;
 
@@ -17,7 +20,7 @@ namespace CmdSpy.App;
 /// with a details pane, filtering, target configuration and quick access to the
 /// on-disk logs.
 /// </summary>
-public sealed class MainForm : Form
+public sealed partial class MainForm : Form
 {
     private readonly CmdSpyEngine _engine;
 
@@ -41,6 +44,15 @@ public sealed class MainForm : Form
     private System.Windows.Forms.Timer _uptimeTimer = null!;
     private bool _warnedEtw;
 
+    // Boot service: while it runs, this window follows its log instead of
+    // capturing on its own (so nothing is captured twice).
+    private LogFollower? _follower;
+    private ToolStripStatusLabel _lblService = null!;
+    private System.Windows.Forms.Timer _serviceTimer = null!;
+
+    // Analyses run from the GUI when this window isn't the one capturing.
+    private Investigator? _onDemand;
+
     public MainForm()
     {
         _engine = new CmdSpyEngine();
@@ -55,7 +67,7 @@ public sealed class MainForm : Form
 
     private void BuildUi()
     {
-        Text = "CMD-spy — command-prompt popup monitor";
+        Text = $"CMD-spy {Application.ProductVersion.Split('+')[0]} — command-prompt popup monitor";
         Width = 1200;
         Height = 720;
         MinimumSize = new Size(820, 480);
@@ -95,8 +107,17 @@ public sealed class MainForm : Form
         _uptimeTimer.Tick += (_, _) => UpdateUptime();
         _uptimeTimer.Start();
 
+        _serviceTimer = new System.Windows.Forms.Timer { Interval = 5000 };
+        _serviceTimer.Tick += (_, _) => SyncWithService();
+
         Load += (_, _) => OnFormLoad();
         FormClosing += (_, _) => _engine.Dispose();
+        FormClosing += (_, _) =>
+        {
+            _serviceTimer.Stop();
+            _follower?.Dispose();
+            _onDemand?.Dispose();
+        };
     }
 
     private void BuildToolbar()
@@ -119,6 +140,8 @@ public sealed class MainForm : Form
         btnExport.Click += (_, _) => ExportView();
 
         var targets = BuildTargetsDropDown();
+        var investigate = BuildInvestigateDropDown();
+        var service = BuildServiceDropDown();
 
         _txtFilter = new ToolStripTextBox { Width = 220, ToolTipText = "Filter by command line, process or parent" };
         _txtFilter.TextChanged += (_, _) => ApplyFilter(_txtFilter.Text);
@@ -127,7 +150,7 @@ public sealed class MainForm : Form
         {
             _btnStart, _btnStop, new ToolStripSeparator(),
             btnClear, btnLogs, btnExport, new ToolStripSeparator(),
-            targets, new ToolStripSeparator(),
+            targets, investigate, service, new ToolStripSeparator(),
             new ToolStripLabel("Filter:"), _txtFilter
         });
     }
@@ -210,6 +233,8 @@ public sealed class MainForm : Form
         AddColumn("Process", nameof(CmdEvent.ProcessName), 100);
         AddColumn("Command line", nameof(CmdEvent.CommandLineShort), 340);
         AddColumn("Cause (parent)", nameof(CmdEvent.CauseDisplay), 160);
+        AddColumn("Risk", nameof(CmdEvent.RiskDisplay), 85);
+        AddColumn("Launched by", nameof(CmdEvent.OriginDisplay), 170);
         AddColumn("Lifetime", nameof(CmdEvent.LifetimeDisplay), 90);
         AddColumn("Net", nameof(CmdEvent.NetworkCount), 45);
         AddColumn("Kids", nameof(CmdEvent.ChildCount), 45);
@@ -217,6 +242,7 @@ public sealed class MainForm : Form
 
         _grid.DataSource = _view;
         _grid.SelectionChanged += (_, _) => ShowSelectedDetails();
+        _grid.CellFormatting += (_, e) => ColorByRisk(e);
     }
 
     private void AddColumn(string header, string property, int width)
@@ -237,10 +263,12 @@ public sealed class MainForm : Form
         _lblCount = new ToolStripStatusLabel("Events: 0");
         _lblBoot = new ToolStripStatusLabel("Boot: —");
         _lblUptime = new ToolStripStatusLabel("Uptime: —") { Spring = true, TextAlign = ContentAlignment.MiddleRight };
+        _lblService = new ToolStripStatusLabel("Boot service: —");
         _statusBar.Items.AddRange(new ToolStripItem[]
         {
             _lblStatus, new ToolStripStatusLabel("|"),
             _lblCount, new ToolStripStatusLabel("|"),
+            _lblService, new ToolStripStatusLabel("|"),
             _lblBoot, _lblUptime
         });
     }
@@ -249,6 +277,16 @@ public sealed class MainForm : Form
 
     private void OnFormLoad()
     {
+        _serviceTimer.Start();
+        UpdateServiceLabel();
+
+        // The boot service is already capturing: show its log live instead.
+        if (ServiceControl.IsRunning)
+        {
+            StartFollowing();
+            return;
+        }
+
         // Surface any history already logged today.
         try
         {
@@ -382,6 +420,8 @@ public sealed class MainForm : Form
             || Contains(ev.ParentProcessName, f)
             || Contains(ev.ParentCommandLine, f)
             || Contains(ev.UserName, f)
+            || Contains(ev.RiskDisplay, f)
+            || Contains(ev.OriginDisplay, f)
             || ev.ProcessId.ToString().Contains(f);
     }
 
@@ -461,6 +501,13 @@ public sealed class MainForm : Form
         var up = Core.Monitoring.SystemTimings.Uptime;
         _lblBoot.Text = $"Boot: {boot:yyyy-MM-dd HH:mm:ss}";
         _lblUptime.Text = $"Uptime: {(int)up.TotalHours:D2}:{up.Minutes:D2}:{up.Seconds:D2}";
+
+        // Capture health: the kernel reports events it had to drop under load.
+        if (_engine.IsRunning && _engine.EventsLost is int lost && lost > 0)
+        {
+            _lblStatus.Text = $"Monitoring ({_engine.WatcherName}) — {lost} kernel events lost";
+            _lblStatus.ForeColor = Color.Orange;
+        }
     }
 
     private void UiInvoke(Action action)

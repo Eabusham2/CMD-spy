@@ -34,6 +34,55 @@ public sealed class CmdSpyOptions
     /// </summary>
     public TimeSpan ActiveTrackingWindow { get; set; } = TimeSpan.FromMinutes(10);
 
+    // ---- Investigation ----------------------------------------------------
+
+    /// <summary>
+    /// Run the background investigation for each capture: launch chain,
+    /// referenced processes, command explanation, suspicious indicators,
+    /// signatures, scheduled task, event-log history and risk assessment.
+    /// </summary>
+    public bool InvestigateEvents { get; set; } = true;
+
+    /// <summary>Check Authenticode signatures and publishers of the executables involved.</summary>
+    public bool VerifySignatures { get; set; } = true;
+
+    /// <summary>Compute SHA-256 hashes of the executables involved.</summary>
+    public bool ComputeFileHashes { get; set; } = true;
+
+    /// <summary>Work out which scheduled task (if any) caused a launch.</summary>
+    public bool CorrelateScheduledTasks { get; set; } = true;
+
+    /// <summary>Read related Windows event logs (Security 4688, Sysmon, PowerShell, Task Scheduler).</summary>
+    public bool CorrelateEventLogs { get; set; } = true;
+
+    /// <summary>
+    /// Snapshot every running process when monitoring starts, so parents and
+    /// referenced PIDs that predate CMD-spy can still be identified.
+    /// </summary>
+    public bool SeedProcessCache { get; set; } = true;
+
+    /// <summary>How long exited processes are remembered for launch chains and PID lookups.</summary>
+    public TimeSpan ProcessHistoryRetention { get; set; } = TimeSpan.FromHours(6);
+
+    /// <summary>Upper bound on descendants (children, grandchildren...) recorded per popup.</summary>
+    public int MaxDescendantsPerEvent { get; set; } = 200;
+
+    // ---- Network ----------------------------------------------------------
+
+    /// <summary>
+    /// Capture connections as they happen through a separate ETW kernel network
+    /// session (TCP connect/accept, UDP send), in addition to the snapshot.
+    /// </summary>
+    public bool CaptureNetworkEvents { get; set; } = true;
+
+    // ---- ETW session names -------------------------------------------------
+
+    /// <summary>Kernel process-trace session name (distinct per host so the GUI and service don't collide).</summary>
+    public string EtwSessionName { get; set; } = "CmdSpy-KernelProcessSession";
+
+    /// <summary>Kernel network-trace session name.</summary>
+    public string EtwNetworkSessionName { get; set; } = "CmdSpy-KernelNetworkSession";
+
     public static string DefaultLogDirectory() => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
         "CmdSpy", "logs");

@@ -85,6 +85,91 @@ public static class ProcessSnapshot
         return (null, -1);
     }
 
+    /// <summary>
+    /// Every process running right now, with parent PID and creation time — used
+    /// to seed the process history when monitoring starts, so launch chains and
+    /// referenced PIDs can be resolved for processes that predate CMD-spy.
+    /// </summary>
+    public static List<ProcessRecord> SnapshotAll()
+    {
+        var records = new List<ProcessRecord>();
+        try
+        {
+            using var searcher = new ManagementObjectSearcher(
+                "SELECT ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine, CreationDate, SessionId " +
+                "FROM Win32_Process");
+            foreach (ManagementObject mo in searcher.Get())
+            {
+                using (mo)
+                {
+                    var record = ToRecord(mo, "snapshot");
+                    if (record is not null) records.Add(record);
+                }
+            }
+        }
+        catch
+        {
+            // WMI unavailable — the cache simply starts empty.
+        }
+        return records;
+    }
+
+    /// <summary>A running process's identity including parent PID and creation time.</summary>
+    public static ProcessRecord? TryGetRecord(int pid)
+    {
+        if (pid <= 0) return null;
+        try
+        {
+            using var searcher = new ManagementObjectSearcher(
+                "SELECT ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine, CreationDate, SessionId " +
+                $"FROM Win32_Process WHERE ProcessId = {pid}");
+            foreach (ManagementObject mo in searcher.Get())
+            {
+                using (mo)
+                {
+                    return ToRecord(mo, "live");
+                }
+            }
+        }
+        catch
+        {
+            // best effort
+        }
+        return null;
+    }
+
+    private static ProcessRecord? ToRecord(ManagementBaseObject mo, string source)
+    {
+        int pid;
+        try { pid = Convert.ToInt32(mo["ProcessId"]); } catch { return null; }
+
+        int parent = 0;
+        try { parent = Convert.ToInt32(mo["ParentProcessId"]); } catch { }
+
+        int session = -1;
+        try { session = Convert.ToInt32(mo["SessionId"]); } catch { }
+
+        var start = DateTimeOffset.MinValue;
+        try
+        {
+            if (mo["CreationDate"] is string created && created.Length > 0)
+                start = new DateTimeOffset(ManagementDateTimeConverter.ToDateTime(created)).ToUniversalTime();
+        }
+        catch { }
+
+        return new ProcessRecord
+        {
+            ProcessId = pid,
+            ParentProcessId = parent,
+            Name = mo["Name"] as string ?? "",
+            ImagePath = mo["ExecutablePath"] as string,
+            CommandLine = mo["CommandLine"] as string,
+            StartTimeUtc = start,
+            SessionId = session,
+            Source = source
+        };
+    }
+
     /// <summary>Lists processes whose parent is <paramref name="parentPid"/>.</summary>
     public static List<ProcessInfo> GetChildren(int parentPid)
     {
