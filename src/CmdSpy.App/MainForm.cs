@@ -53,14 +53,23 @@ public sealed partial class MainForm : Form
     // Analyses run from the GUI when this window isn't the one capturing.
     private Investigator? _onDemand;
 
-    public MainForm()
+    public MainForm() : this(startInTray: false, instance: null)
     {
+    }
+
+    /// <param name="startInTray">Start hidden in the notification area (used at log on).</param>
+    /// <param name="instance">The single-instance guard; a second start brings this window forward.</param>
+    public MainForm(bool startInTray, SingleInstance? instance)
+    {
+        _startInTray = startInTray;
         _engine = new CmdSpyEngine();
         _engine.EventCaptured += (_, ev) => UiInvoke(() => OnCaptured(ev));
         _engine.EventUpdated += (_, ev) => UiInvoke(() => OnUpdated(ev));
         _engine.Status += (_, msg) => UiInvoke(() => OnStatus(msg));
 
         BuildUi();
+        BuildTray();
+        instance?.OnActivationRequested(() => UiInvoke(ShowFromTray));
     }
 
     // ----------------------------------------------------------------- UI ----
@@ -72,6 +81,7 @@ public sealed partial class MainForm : Form
         Height = 720;
         MinimumSize = new Size(820, 480);
         StartPosition = FormStartPosition.CenterScreen;
+        Icon = AppIcon;
 
         BuildToolbar();
         BuildStatusBar();
@@ -111,12 +121,14 @@ public sealed partial class MainForm : Form
         _serviceTimer.Tick += (_, _) => SyncWithService();
 
         Load += (_, _) => OnFormLoad();
-        FormClosing += (_, _) => _engine.Dispose();
-        FormClosing += (_, _) =>
+        FormClosing += OnFormClosingToTray;
+        FormClosed += (_, _) => _engine.Dispose();
+        FormClosed += (_, _) =>
         {
             _serviceTimer.Stop();
             _follower?.Dispose();
             _onDemand?.Dispose();
+            DisposeTray();
         };
     }
 
@@ -142,6 +154,7 @@ public sealed partial class MainForm : Form
         var targets = BuildTargetsDropDown();
         var investigate = BuildInvestigateDropDown();
         var service = BuildServiceDropDown();
+        var startup = BuildStartupDropDown();
 
         _txtFilter = new ToolStripTextBox { Width = 220, ToolTipText = "Filter by command line, process or parent" };
         _txtFilter.TextChanged += (_, _) => ApplyFilter(_txtFilter.Text);
@@ -150,7 +163,7 @@ public sealed partial class MainForm : Form
         {
             _btnStart, _btnStop, new ToolStripSeparator(),
             btnClear, btnLogs, btnExport, new ToolStripSeparator(),
-            targets, investigate, service, new ToolStripSeparator(),
+            targets, investigate, service, startup, new ToolStripSeparator(),
             new ToolStripLabel("Filter:"), _txtFilter
         });
     }
@@ -277,6 +290,8 @@ public sealed partial class MainForm : Form
 
     private void OnFormLoad()
     {
+        if (_loaded) return;
+        _loaded = true;
         _serviceTimer.Start();
         UpdateServiceLabel();
 
@@ -371,6 +386,7 @@ public sealed partial class MainForm : Form
 
     private void OnUpdated(CmdEvent ev)
     {
+        NotifyIfSuspicious(ev);
         var idx = _view.IndexOf(ev);
         if (idx >= 0)
         {
@@ -501,6 +517,7 @@ public sealed partial class MainForm : Form
         var up = Core.Monitoring.SystemTimings.Uptime;
         _lblBoot.Text = $"Boot: {boot:yyyy-MM-dd HH:mm:ss}";
         _lblUptime.Text = $"Uptime: {(int)up.TotalHours:D2}:{up.Minutes:D2}:{up.Seconds:D2}";
+        UpdateTrayText();
 
         // Capture health: the kernel reports events it had to drop under load.
         if (_engine.IsRunning && _engine.EventsLost is int lost && lost > 0)

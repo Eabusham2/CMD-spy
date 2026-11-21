@@ -57,6 +57,15 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
 
     private sealed record DescendantLink(CmdEvent Root, int Depth, DateTimeOffset StartUtc);
 
+    // Popups and actions that exited a moment ago. Kernel network events come
+    // through their own trace session and can be delivered after the exit was
+    // handled; these let a late connection still reach the right popup.
+    private readonly ConcurrentDictionary<int, ExitedLink> _recentlyExited = new();
+    private readonly ConcurrentDictionary<int, ExitedLink> _recentlyExitedDescendants = new();
+    private static readonly TimeSpan RecentExitWindow = TimeSpan.FromSeconds(60);
+
+    private sealed record ExitedLink(CmdEvent Event, DateTimeOffset StartUtc, DateTimeOffset ExitUtc);
+
     public CmdSpyEngine(CmdSpyOptions? options = null)
     {
         _options = options ?? new CmdSpyOptions();
@@ -105,17 +114,23 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
         if (IsRunning) return;
 
         // Remember everything already running, so parents and referenced PIDs
-        // that predate monitoring can still be identified.
+        // that predate monitoring can still be identified. This runs in the
+        // background so capture starts at once (the snapshot can take a few
+        // seconds at boot); analyses wait for it before they begin.
+        System.Threading.Tasks.Task? warmUp = null;
         if (_options.SeedProcessCache)
         {
-            try { _processes.Seed(ProcessSnapshot.SnapshotAll()); } catch { }
+            warmUp = System.Threading.Tasks.Task.Run(() =>
+            {
+                try { _processes.Seed(ProcessSnapshot.SnapshotAll()); } catch { }
+            });
         }
 
         if (_options.InvestigateEvents)
         {
             _investigator = new Investigator(_processes, _options);
             _investigator.Completed += OnInvestigationCompleted;
-            _investigator.Start();
+            _investigator.Start(warmUp);
         }
 
         _watcher = _watcherFactory is null ? StartBestWatcher() : StartWatcher(_watcherFactory());
@@ -268,6 +283,21 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
             CaptureSource = e.Source
         };
 
+        // ETW usually reports only the short image name. Ask Windows for the full
+        // path while the process is (normally) still running — a trusted source,
+        // unlike the command line, which a program can fake.
+        if (!ProcessImageResolver.IsRooted(ev.ImagePath))
+        {
+            var (livePath, liveStart) = ProcessImageResolver.TryQueryLive(e.ProcessId);
+            if (livePath is not null && (liveStart is null || (liveStart.Value - e.TimestampUtc).Duration() <= ProcessCache.Skew))
+            {
+                ev.ImagePath = ProcessImageResolver.NormalizeKernelPath(livePath);
+                var file = ev.ImagePath?[(ev.ImagePath.LastIndexOfAny(new[] { '\\', '/' }) + 1)..];
+                if (!string.IsNullOrEmpty(file) && CmdSpyOptions.Stem(file).Equals(CmdSpyOptions.Stem(ev.ProcessName), StringComparison.OrdinalIgnoreCase))
+                    ev.ProcessName = file;
+            }
+        }
+
         // Recover the command line if the detector didn't provide one (WMI path).
         if (string.IsNullOrWhiteSpace(ev.CommandLine))
         {
@@ -340,6 +370,7 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
             if (nowUtc - pair.Value.StartUtc > window)
                 _descendants.TryRemove(pair.Key, out _);
         }
+        PruneRecentlyExited(nowUtc);
         if (_finalWritten.Count > 20_000) _finalWritten.Clear();
     }
 
@@ -400,6 +431,7 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
         RecordDescendantExit(e);
 
         if (!_active.TryRemove(e.ProcessId, out var ev)) return;
+        _recentlyExited[e.ProcessId] = new ExitedLink(ev, ev.TimestampUtc, e.TimestampUtc);
 
         bool analysisPending;
         lock (ev)
@@ -429,7 +461,11 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
     private void RecordDescendantExit(ProcessStoppedEventArgs e)
     {
         var owners = new List<CmdEvent>(2);
-        if (_descendants.TryRemove(e.ProcessId, out var link)) owners.Add(link.Root);
+        if (_descendants.TryRemove(e.ProcessId, out var link))
+        {
+            owners.Add(link.Root);
+            _recentlyExitedDescendants[e.ProcessId] = new ExitedLink(link.Root, link.StartUtc, e.TimestampUtc);
+        }
         var record = _processes.TryGet(e.ProcessId, e.TimestampUtc);
         if (record is not null && _active.TryGetValue(record.ParentProcessId, out var directParent) && !owners.Contains(directParent))
             owners.Add(directParent);
@@ -516,7 +552,17 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
 
         var targets = new List<CmdEvent>(2);
         if (_active.TryGetValue(pid, out var own)) targets.Add(own);
-        if (_descendants.TryGetValue(pid, out var link) && !targets.Contains(link.Root)) targets.Add(link.Root);
+        else if (_recentlyExited.TryGetValue(pid, out var gone) && Within(connection, gone)) targets.Add(gone.Event);
+
+        if (_descendants.TryGetValue(pid, out var link))
+        {
+            if (!targets.Contains(link.Root)) targets.Add(link.Root);
+        }
+        else if (_recentlyExitedDescendants.TryGetValue(pid, out var goneChild) && Within(connection, goneChild) &&
+                 !targets.Contains(goneChild.Event))
+        {
+            targets.Add(goneChild.Event);
+        }
 
         if (targets.Count == 0)
         {
@@ -538,6 +584,19 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
         if (!added) return;
         _store.AppendUpdate(target, "network");
         EventUpdated?.Invoke(this, target);
+    }
+
+    /// <summary>True if the connection happened while that (now exited) process was alive.</summary>
+    private static bool Within(NetworkConnectionInfo connection, ExitedLink link) =>
+        connection.ObservedAtUtc is not { } at ||
+        (at >= link.StartUtc - ProcessCache.Skew && at <= link.ExitUtc + ProcessCache.Skew);
+
+    private void PruneRecentlyExited(DateTimeOffset nowUtc)
+    {
+        foreach (var map in new[] { _recentlyExited, _recentlyExitedDescendants })
+            foreach (var pair in map)
+                if (nowUtc - pair.Value.ExitUtc > RecentExitWindow)
+                    map.TryRemove(pair.Key, out _);
     }
 
     private static bool SameEndpoint(NetworkConnectionInfo a, NetworkConnectionInfo b) =>
@@ -599,6 +658,8 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
         _descendants.Clear();
         _pendingConnections.Clear();
         _reanalysisRequested.Clear();
+        _recentlyExited.Clear();
+        _recentlyExitedDescendants.Clear();
         Status?.Invoke(this, "Monitoring stopped.");
     }
 

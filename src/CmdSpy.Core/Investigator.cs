@@ -55,14 +55,19 @@ public sealed class Investigator : IDisposable
     /// <summary>True while another analysis pass for this event is waiting in the queue.</summary>
     public bool IsQueued(Guid eventId) => _queued.ContainsKey(eventId);
 
-    public void Start()
+    /// <param name="warmUp">Work to finish before the first analysis (e.g. the start-up process snapshot); capture is not held up by it.</param>
+    public void Start(System.Threading.Tasks.Task? warmUp = null)
     {
         if (_worker is not null) return;
         _queue = new BlockingCollection<CmdEvent>(new ConcurrentQueue<CmdEvent>());
         _cancel = new CancellationTokenSource();
         var queue = _queue;
         var token = _cancel.Token;
-        _worker = new Thread(() => Run(queue, token))
+        _worker = new Thread(() =>
+        {
+            try { warmUp?.Wait(TimeSpan.FromSeconds(30)); } catch { }
+            Run(queue, token);
+        })
         {
             IsBackground = true,
             Name = "CmdSpy-Investigator",

@@ -28,6 +28,17 @@ internal static class ServiceControl
 
     public static string StatusLogPath(string logDirectory) => Path.Combine(logDirectory, "cmdspy-service.log");
 
+    /// <summary>Where the installed copy of the running app lives.</summary>
+    public static string InstalledAppPath
+    {
+        get
+        {
+            var host = Environment.ProcessPath ?? "CmdSpy.exe";
+            bool dotnetHost = Path.GetFileNameWithoutExtension(host).Equals("dotnet", StringComparison.OrdinalIgnoreCase);
+            return Path.Combine(InstallDirectory, dotnetHost ? "CmdSpy.dll" : Path.GetFileName(host));
+        }
+    }
+
     /// <summary>Current state, or null when the service is not installed.</summary>
     public static ServiceControllerStatus? GetStatus()
     {
@@ -57,6 +68,30 @@ internal static class ServiceControl
         ServiceControllerStatus.StopPending => "stopping",
         var other => other.ToString()!.ToLowerInvariant()
     };
+
+    /// <summary>
+    /// Copies CMD-spy into Program Files and returns the installed executable,
+    /// pausing the boot service while its files are replaced.
+    /// </summary>
+    public static string InstallFiles(List<string> log)
+    {
+        var same = string.Equals(Path.GetFullPath(AppContext.BaseDirectory).TrimEnd('\\'),
+            Path.GetFullPath(InstallDirectory).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+        bool pause = !same && IsRunning;
+        if (pause) StopService(log);
+        try
+        {
+            return CopyToInstallDirectory(log);
+        }
+        finally
+        {
+            if (pause)
+            {
+                try { StartService(log); }
+                catch (Exception ex) { log.Add($"Could not restart the boot service: {ex.Message}"); }
+            }
+        }
+    }
 
     /// <summary>Copies CMD-spy to Program Files, registers the auto-start service and starts it.</summary>
     public static List<string> Install()

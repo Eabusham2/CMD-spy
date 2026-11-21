@@ -32,6 +32,10 @@ internal sealed class CmdSpyService : ServiceBase
         // Snapshotting every running process can take a few seconds on a busy machine.
         RequestAdditionalTime(30_000);
 
+        // Boot is when the most is starting at once: run at high priority for
+        // the first minutes so capture keeps up, then go back to normal.
+        StartupPriority.Boost(TimeSpan.FromMinutes(2));
+
         var options = new CmdSpyOptions
         {
             EtwSessionName = ProcessSessionName,

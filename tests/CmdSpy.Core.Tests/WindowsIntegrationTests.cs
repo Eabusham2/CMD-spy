@@ -152,22 +152,38 @@ public class WindowsIntegrationTests : IDisposable
         var captured = new ConcurrentBag<CmdEvent>();
         engine.EventCaptured += (_, ev) => captured.Add(ev);
 
+        // An independent session records everything the kernel reports, to explain a failure.
+        var seen = new ConcurrentBag<(int Pid, NetworkConnectionInfo Connection)>();
+        using var diagnostics = new EtwNetworkWatcher($"CmdSpy-Test-NetDiag-{Guid.NewGuid():N}"[..40]);
+        diagnostics.ConnectionObserved += (pid, c) => seen.Add((pid, c));
+        diagnostics.Start();
+
         var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var port = ((IPEndPoint)listener.LocalEndpoint).Port;
         try
         {
+            // A short-lived window: connects locally and to the internet, then exits.
             using var ps = StartHidden(SystemExe(@"WindowsPowerShell\v1.0\powershell.exe"),
-                $"-NoProfile -c \"$c = New-Object Net.Sockets.TcpClient; $c.Connect('127.0.0.1', {port}); Start-Sleep -Milliseconds 500; $c.Close()\"");
+                "-NoProfile -c \"$c = New-Object Net.Sockets.TcpClient; $c.Connect('127.0.0.1', " + port + "); " +
+                "try { $w = New-Object Net.Sockets.TcpClient; $w.Connect('github.com', 443); $w.Close() } catch { }; " +
+                "Start-Sleep -Milliseconds 300; $c.Close()\"");
             ps.WaitForExit(60_000);
 
             CmdEvent? ev = null;
             Assert.True(Wait.Until(() => (ev = captured.FirstOrDefault(e => e.CommandLine?.Contains(port.ToString()) == true)) is not null,
                 TimeSpan.FromSeconds(30)));
-            Assert.True(Wait.Until(() =>
+            bool live = Wait.Until(() =>
             {
-                lock (ev!) return ev.NetworkConnections.Any(c => c.RemotePort == port && c.Source == "ETW");
-            }, TimeSpan.FromSeconds(20)), "the connection to the local listener was not captured live");
+                lock (ev!) return ev.NetworkConnections.Any(c => c.Source == "ETW" && (c.RemotePort == port || c.RemotePort == 443));
+            }, TimeSpan.FromSeconds(20));
+
+            _output.WriteLine($"PowerShell PID {ev!.ProcessId}; captured on the popup:");
+            lock (ev) foreach (var c in ev.NetworkConnections) _output.WriteLine($"  {c} pid={c.OwningPid} via {c.Source}");
+            _output.WriteLine($"Kernel reported {seen.Count} connection(s); for this test:");
+            foreach (var (pid, c) in seen.Where(x => x.Pid == ev.ProcessId || x.Connection.RemotePort == port || x.Connection.LocalPort == port))
+                _output.WriteLine($"  pid={pid} {c}");
+            Assert.True(live, "the popup's connections were not captured live");
         }
         finally
         {

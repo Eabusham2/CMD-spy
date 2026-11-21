@@ -26,9 +26,12 @@ who really launched it, what the command does in plain words, which processes it
 refers to, whether the programs involved are genuine, which scheduled task is
 behind it, what the Windows event logs say, and an evidence-based risk verdict.
 
-Everything is written to **log files** and shown live in the **GUI** — and an
-optional **boot service** captures from the moment Windows starts, before anyone
-logs in.
+Everything is written to **log files** and shown live in the **GUI**. CMD-spy
+lives in the **notification area (tray)** — closing the window keeps it
+monitoring, and it alerts you when a popup looks suspicious — and it can
+**start with Windows** in several ways at once (a boot service that captures
+before anyone logs in, plus an elevated, high-priority logon start), so it is
+there first. Only one copy ever runs.
 
 ---
 
@@ -134,6 +137,41 @@ Start, stop and uninstall it from the same menu; its own status messages go to
 
 ---
 
+## Start with Windows — fast, first, and more than one way
+
+**Startup ▸ Start with Windows — every method** sets up both of these:
+
+1. **Boot service** (above) — starts with Windows itself, before the log-on
+   screen, at high priority for its first minutes, so popups during start-up
+   are captured.
+2. **Logon task** — opens CMD-spy in the notification area the instant you log
+   in: elevated without a UAC prompt, at **high priority** and with **no
+   delay**, ahead of the usual start-up programs (Windows won't auto-start
+   Administrator programs from the Run key or Startup folder, so a Task
+   Scheduler task is used). If CMD-spy is closed or crashes, the same task
+   brings it back when you unlock or reconnect.
+
+Each can also be switched on or off on its own from the **Startup ▾** menu (or
+**Don't start with Windows** to remove both). Both run the copy installed in
+`%ProgramFiles%\CmdSpy`. Releases are precompiled (ReadyToRun) so CMD-spy starts
+quickly, and capture begins before the start-up process snapshot finishes.
+
+## Tray mode and single instance
+
+- CMD-spy shows an icon in the notification area. **Closing the window keeps it
+  monitoring there** (turn this off under Startup ▾); right-click the icon to
+  open it, pause/resume monitoring, change start-up, or exit.
+- **Alerts**: when a popup is analysed as **High risk** or **Suspicious**, a
+  notification shows what ran and what launched it — click it to jump to that
+  popup. (Startup ▾ / tray menu → *Alert me about suspicious popups*.)
+- **Only one copy runs.** Starting CMD-spy again just brings the running window
+  forward, so there is never a second capture writing the same logs. To update
+  to a new release, exit CMD-spy from the tray, run the new version and choose
+  **Startup ▸ Start with Windows — every method** again (it replaces the
+  installed copy).
+
+---
+
 ## Project layout
 
 ```
@@ -219,6 +257,8 @@ full details (command line, cause, actions, networking, timing). Toolbar:
   `cscript.exe`, `mshta.exe`, `wt.exe`, `WindowsTerminal.exe`,
   `OpenConsole.exe`); untick any you don't want, and toggle network /
   child-process capture
+- **Startup ▾** — start with Windows (boot service and/or tray at log on), keep
+  monitoring in the tray when closed, suspicious-popup alerts
 - **Investigate ▾** — re-analyse or copy the report of the selected popup,
   import past popups from the Windows event logs, check/turn on Windows logging,
   run the capture self-test

@@ -1,8 +1,10 @@
 using System;
 using System.Diagnostics;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Windows.Forms;
+using CmdSpy.Core;
 
 namespace CmdSpy.App;
 
@@ -18,6 +20,11 @@ internal static class Program
             System.ServiceProcess.ServiceBase.Run(new CmdSpyService());
             return;
         }
+
+        // --tray: start hidden in the notification area. --startup: started with
+        // Windows (by the logon task) — get going at high priority, quietly.
+        bool startInTray = HasArg(args, "--tray");
+        bool atStartup = HasArg(args, "--startup");
 
         // CMD-spy needs Administrator rights for ETW / WMI process tracing. The
         // app manifest already requests elevation for the CmdSpy.exe host, but if
@@ -36,9 +43,32 @@ internal static class Program
                 "CMD-spy", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
+        // Only one CMD-spy at a time: starting it again brings the running one forward.
+        using var instance = new SingleInstance();
+        if (!instance.IsFirst)
+        {
+            if (!atStartup)
+            {
+                AllowSetForegroundWindow(-1);   // ASFW_ANY: let the running copy take the foreground
+                if (!instance.ActivateFirst())
+                    MessageBox.Show("CMD-spy is already running (possibly in another user's session).",
+                        "CMD-spy", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            return;
+        }
+
+        if (atStartup)
+            StartupPriority.Boost(TimeSpan.FromSeconds(90));   // be up and monitoring first, then back to normal
+
         ApplicationConfiguration.Initialize();
-        Application.Run(new MainForm());
+        Application.Run(new MainForm(startInTray, instance));
     }
+
+    private static bool HasArg(string[] args, string name) =>
+        args.Any(a => a.Equals(name, StringComparison.OrdinalIgnoreCase));
+
+    [DllImport("user32.dll")]
+    private static extern bool AllowSetForegroundWindow(int processId);
 
     /// <summary>True if the current process is running with Administrator rights.</summary>
     private static bool IsElevated()

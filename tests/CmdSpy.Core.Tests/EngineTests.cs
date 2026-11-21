@@ -149,6 +149,36 @@ public class EngineTests : IDisposable
     }
 
     [Fact]
+    public void NetworkEventsArrivingAfterTheExitStillReachThePopup()
+    {
+        using var engine = NewEngine(network: true);
+        CmdEvent? captured = null;
+        engine.EventCaptured += (_, ev) => captured = ev;
+        var t = DateTimeOffset.UtcNow;
+
+        LaunchChain(t);
+        _watcher.Started(Cmd, Updater, "powershell.exe", "powershell -c iwr https://example.com", t.AddMilliseconds(1));
+        _watcher.Started(Ping, Cmd, "curl.exe", "curl https://example.com", t.AddMilliseconds(5));
+        _watcher.Stopped(Ping, t.AddMilliseconds(300));
+        _watcher.Stopped(Cmd, t.AddMilliseconds(400));
+
+        // The kernel network session delivers these after both exits were handled.
+        NetworkConnectionInfo Conn(int pid, int port, double atMs) => new()
+        {
+            Protocol = "TCP", LocalAddress = "10.0.0.2", LocalPort = port, RemoteAddress = "93.184.216.34", RemotePort = 443,
+            State = "CONNECT", OwningPid = pid, Source = "ETW", ObservedAtUtc = t.AddMilliseconds(atMs)
+        };
+        engine.OnConnectionObserved(Cmd, Conn(Cmd, 50010, 200));
+        engine.OnConnectionObserved(Ping, Conn(Ping, 50011, 100));
+        // ...but a connection from after the exit belongs to whatever reuses the PID.
+        engine.OnConnectionObserved(Cmd, Conn(Cmd, 50012, 9_000));
+
+        Assert.NotNull(captured);
+        var ports = captured!.NetworkConnections.Select(c => c.LocalPort).OrderBy(p => p).ToList();
+        Assert.Equal(new[] { 50010, 50011 }, ports);
+    }
+
+    [Fact]
     public void FinalRecordWaitsForTheInvestigationAndIncludesIt()
     {
         using var engine = NewEngine(investigate: true);

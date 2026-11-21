@@ -64,7 +64,8 @@ public sealed class EtwProcessWatcher : IProcessWatcher
         _pumpThread = new Thread(PumpEvents)
         {
             IsBackground = true,
-            Name = "CmdSpy-ETW-Pump"
+            Name = "CmdSpy-ETW-Pump",
+            Priority = ThreadPriority.AboveNormal   // keep up with bursts of process starts
         };
         _pumpThread.Start();
     }
@@ -108,6 +109,9 @@ public sealed class EtwProcessWatcher : IProcessWatcher
         // The kernel's short name drops ".exe" and is cut at 15 characters
         // ("asus_framework."); the file name from the full path is exact.
         var name = string.IsNullOrEmpty(data.ProcessName) ? data.ImageFileName : data.ProcessName;
+        var shortName = data.ImageFileName;
+        if (!string.IsNullOrEmpty(shortName) && shortName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            name = shortName;   // e.g. "powershell.exe" (complete, not cut off)
         if (image is not null && image.Contains('\\'))
             name = image[(image.LastIndexOf('\\') + 1)..];
 

@@ -54,8 +54,10 @@ jobs:
       - name: Publish app
         run: dotnet publish src/CmdSpy.App/CmdSpy.App.csproj -c Release -o publish/CmdSpy --no-build
 
+      # ReadyToRun precompiles the app so it starts fast — at log on it should
+      # be monitoring before the other start-up programs.
       - name: Publish app (self-contained, no .NET install needed)
-        run: dotnet publish src/CmdSpy.App/CmdSpy.App.csproj -c Release -r win-x64 --self-contained true -o publish/CmdSpy-win-x64 -p:Version=${{ steps.version.outputs.version }}
+        run: dotnet publish src/CmdSpy.App/CmdSpy.App.csproj -c Release -r win-x64 --self-contained true -p:PublishReadyToRun=true -o publish/CmdSpy-win-x64 -p:Version=${{ steps.version.outputs.version }}
 
       - name: Package
         shell: pwsh
@@ -92,7 +94,8 @@ jobs:
           - **Authenticity**: Authenticode signature, publisher and SHA-256 of every program involved
           - **Windows event history**: Security 4688, Sysmon, PowerShell and Task Scheduler logs; import popups from before CMD-spy was running
           - **Risk assessment** with its uncertainty spelled out — CMD-spy never declares a computer "clean"
-          - **Boot service**: optional Windows service that captures from boot, before anyone logs in
+          - **Starts with Windows, first**: boot service (captures before login) + elevated high-priority logon task that opens it in the tray; ReadyToRun build for a fast start
+          - **Tray mode**: keeps monitoring in the notification area, with alerts for High-risk / Suspicious popups; only one copy can run
           - **Capture self-test** and an ETW stress test in CI that verifies full command lines under rapid exits
           "@
           gh release create "v$version" "CmdSpy-$version-win-x64.zip" --title "CMD-spy v$version" --notes $notes --target "${{ github.sha }}"
