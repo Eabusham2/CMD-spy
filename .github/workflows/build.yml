@@ -3,6 +3,10 @@ name: build
 on:
   push:
     branches: ["**"]
+    # Dev tooling only — no new build/release for these.
+    paths-ignore:
+      - 'tools/**'
+      - '.github/workflows/gui-screenshots.yml'
   pull_request:
 
 permissions:

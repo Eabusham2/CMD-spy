@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Development tool (not shipped): hosts the real CMD-spy window, feeds it a few
+    harmless demo popups and saves screenshots; also smoke-tests the start-up
+    paths. Used by .github/workflows/gui-screenshots.yml on a Windows runner.
+    AppProject picks which CmdSpy.App to photograph (e.g. an older checkout).
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <IsPackable>false</IsPackable>
+    <AppProject Condition="'$(AppProject)' == ''">..\..\src\CmdSpy.App\CmdSpy.App.csproj</AppProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="$(AppProject)" />
+  </ItemGroup>
+
+</Project>
