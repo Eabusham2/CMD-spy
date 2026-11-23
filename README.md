@@ -340,3 +340,12 @@ can be read while CMD-spy is writing them.
   what to look at, together with a full antivirus scan.
 - This is a **defensive / diagnostic** tool: it observes and logs process
   activity on the local machine. It does not block, kill, or modify anything.
+
+## Search keywords (ignore)
+
+`cmd-spy`, `windows`, `command-prompt`, `cmd`, `powershell`, `windows-terminal`,
+`console-monitoring`, `process-monitoring`, `process-creation`, `process-exit`, `command-line-capture`, `parent-process`,
+`process-tree`, `etw`, `event-tracing`, `wmi`, `windows-event-log`, `task-scheduler`,
+`scheduled-tasks`, `authenticode`, `digital-signatures`, `sha256`, `network-connections`, `tcp`,
+`udp`, `jsonl`, `log-files`, `system-tray`, `boot-service`, `startup-monitoring`,
+`risk-assessment`, `defensive-security`, `incident-investigation`, `winforms`, `csharp`, `dotnet`
