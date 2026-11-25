@@ -80,6 +80,20 @@ the analysis is done, so it contains everything below.
 | **What do the Windows logs say?** | Security 4688, Sysmon 1, PowerShell 400/4104 (script blocks) and Task Scheduler records for the popup and its chain. **Investigate ▸ Import past popups** brings in launches from *before* CMD-spy was running. |
 | **Should I be worried?** | A risk verdict — **High risk**, **Suspicious**, **Unknown**, **Low risk** — with a score, confidence, what raised it, what lowered it and what is still unknown. |
 
+### Optional fresh signature checks
+
+**Investigate ▸ Always recheck file signatures (slower)** is unchecked by default.
+Normally, CMD-spy reuses signature, version and SHA-256 results when a file's
+path, size and modification time have not changed. Enable this checkbox to
+inspect each file again on every analysis, including replacements that preserve
+size and modification time. This adds disk reads and signature-verification work.
+SHA-256 remains subject to the separate `ComputeFileHashes` option.
+
+The choice is saved with your GUI preferences and takes effect for future
+analyses in this window, including **Re-analyse selected popup**. Changing it
+clears previous cached results. Existing reports are not automatically rerun,
+and the separate boot service keeps its default cached behavior.
+
 ### CMD-spy never declares a computer "clean"
 
 A harmless-looking command is not proof of a clean machine: a read-only WMI

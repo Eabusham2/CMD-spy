@@ -216,6 +216,28 @@ public class WindowsIntegrationTests : IDisposable
     }
 
     [WindowsFact]
+    public void MetadataPreservingReplacementIsRehashedWhenFreshChecksAreEnabled()
+    {
+        Directory.CreateDirectory(_dir.Path);
+        var path = Path.Combine(_dir.Path, "replace.bin");
+        File.WriteAllBytes(path, new byte[] { 1, 2, 3, 4 });
+        var originalWriteTime = File.GetLastWriteTimeUtc(path);
+        var verifier = new SignatureVerifier { AlwaysRecheck = true };
+
+        var original = verifier.Verify(path, "original");
+        File.WriteAllBytes(path, new byte[] { 5, 6, 7, 8 });
+        File.SetLastWriteTimeUtc(path, originalWriteTime);
+        Assert.Equal(originalWriteTime, File.GetLastWriteTimeUtc(path));
+
+        var replacement = verifier.Verify(path, "replacement");
+
+        Assert.Equal(original.FileSize, replacement.FileSize);
+        Assert.NotNull(original.Sha256);
+        Assert.NotNull(replacement.Sha256);
+        Assert.NotEqual(original.Sha256, replacement.Sha256);
+    }
+
+    [WindowsFact]
     public void LiveLookupFindsThisProcess()
     {
         var (path, started) = ProcessImageResolver.TryQueryLive(Environment.ProcessId);

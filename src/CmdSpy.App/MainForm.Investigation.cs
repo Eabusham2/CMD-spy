@@ -57,13 +57,30 @@ public sealed partial class MainForm
         var selfTest = new ToolStripMenuItem("Run capture self-test (25 instant windows)");
         selfTest.Click += (_, _) => RunSelfTest();
 
+        var freshSignatures = new ToolStripMenuItem("Always recheck file signatures (slower)")
+        {
+            CheckOnClick = true,
+            Checked = _engine.Options.AlwaysRecheckFileSignatures,
+            ToolTipText = "Re-read files for each analysis in this window, even when size and modification time are unchanged. Uses more disk and CPU time."
+        };
+        freshSignatures.CheckedChanged += (_, _) => SetFreshSignatureChecks(freshSignatures.Checked);
+
         drop.DropDownItems.AddRange(new ToolStripItem[]
         {
             reanalyze, copy, new ToolStripSeparator(),
             import, status, enable, new ToolStripSeparator(),
-            selfTest
+            selfTest, new ToolStripSeparator(), freshSignatures
         });
         return drop;
+    }
+
+    private void SetFreshSignatureChecks(bool enabled)
+    {
+        _engine.Options.AlwaysRecheckFileSignatures = enabled;
+        if (_engine.Investigator is { } active) active.Signatures.AlwaysRecheck = enabled;
+        if (_onDemand is { } onDemand) onDemand.Signatures.AlwaysRecheck = enabled;
+        _settings.AlwaysRecheckFileSignatures = enabled;
+        _settings.Save();
     }
 
     private ToolStripDropDownButton BuildServiceDropDown()

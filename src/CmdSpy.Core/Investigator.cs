@@ -35,7 +35,11 @@ public sealed class Investigator : IDisposable
     {
         _processes = processes;
         _options = options;
-        _signatures = signatures ?? new SignatureVerifier { ComputeHashes = options.ComputeFileHashes };
+        _signatures = signatures ?? new SignatureVerifier
+        {
+            ComputeHashes = options.ComputeFileHashes,
+            AlwaysRecheck = options.AlwaysRecheckFileSignatures
+        };
         _taskCatalog = taskCatalog ?? new ScheduledTaskCatalog();
         _history = history ?? new WindowsEventHistory();
         _tasks = new ScheduledTaskCorrelator(_taskCatalog, _history);
