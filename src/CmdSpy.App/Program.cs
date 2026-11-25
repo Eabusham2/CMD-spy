@@ -1,5 +1,4 @@
 using System;
-using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
@@ -26,18 +25,15 @@ internal static class Program
         bool startInTray = HasArg(args, "--tray");
         bool atStartup = HasArg(args, "--startup");
 
-        // CMD-spy needs Administrator rights for ETW / WMI process tracing. The
-        // app manifest already requests elevation for the CmdSpy.exe host, but if
-        // the app is launched another way (e.g. `dotnet CmdSpy.dll`, which ignores
-        // the exe manifest) we self-elevate here so it always runs with the rights
-        // it needs.
+        // CMD-spy needs Administrator rights for ETW process tracing. CmdSpy.exe
+        // requests them in its manifest. Do not self-elevate a launch that bypassed
+        // the manifest (for example, `dotnet CmdSpy.dll`): handing UAC a pathname
+        // would let a writable managed bundle be replaced before the elevated
+        // process opens it. Keep the current process on the WMI fallback instead.
         if (!IsElevated())
         {
-            if (RelaunchElevated())
-                return;   // an elevated instance is starting; this one exits
-
             MessageBox.Show(
-                "CMD-spy could not obtain Administrator rights.\n\n" +
+                "CMD-spy is not running with Administrator rights.\n\n" +
                 "It will keep running with reduced fidelity (WMI fallback); " +
                 "restart it as Administrator for full ETW capture.",
                 "CMD-spy", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -84,46 +80,4 @@ internal static class Program
         }
     }
 
-    /// <summary>
-    /// Relaunches CMD-spy behind a UAC elevation prompt. Returns true if a new
-    /// elevated instance was started (so this one should exit), or false if the
-    /// user declined the prompt or relaunch was not possible.
-    /// </summary>
-    private static bool RelaunchElevated()
-    {
-        try
-        {
-            var host = Environment.ProcessPath;   // CmdSpy.exe, or the dotnet host
-            if (string.IsNullOrEmpty(host)) return false;
-
-            var psi = new ProcessStartInfo
-            {
-                UseShellExecute = true,
-                Verb = "runas",                   // triggers the UAC prompt
-                FileName = host,
-                WorkingDirectory = AppContext.BaseDirectory
-            };
-
-            // When started through the dotnet host, the managed dll is argv[0] and
-            // must be forwarded; otherwise just carry any real arguments across.
-            var argv = Environment.GetCommandLineArgs();
-            var passthrough = IsDotnetHost(host) ? argv : argv.Skip(1);
-            psi.Arguments = string.Join(" ", passthrough.Select(Quote));
-
-            Process.Start(psi);
-            return true;
-        }
-        catch
-        {
-            // ERROR_CANCELLED (user declined) or any other failure.
-            return false;
-        }
-    }
-
-    private static bool IsDotnetHost(string host) =>
-        host.EndsWith("dotnet.exe", StringComparison.OrdinalIgnoreCase) ||
-        host.EndsWith("dotnet", StringComparison.OrdinalIgnoreCase);
-
-    private static string Quote(string arg) =>
-        string.IsNullOrEmpty(arg) || arg.Contains(' ') ? $"\"{arg}\"" : arg;
 }
