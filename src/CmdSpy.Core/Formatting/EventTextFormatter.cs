@@ -32,7 +32,7 @@ public static class EventTextFormatter
 
     private static string FormatLocked(CmdEvent ev, string title, bool finalized)
     {
-        var sb = new StringBuilder();
+        var sb = new LogTextBuilder();
         sb.AppendLine("============================================================");
         sb.AppendLine($"#{ev.SequenceNumber}  {title}   (id {ev.Id})");
         sb.AppendLine("============================================================");
@@ -119,7 +119,7 @@ public static class EventTextFormatter
 
     // ------------------------------------------------------- investigation --
 
-    private static void AppendInvestigation(StringBuilder sb, CmdEvent ev, bool finalized)
+    private static void AppendInvestigation(LogTextBuilder sb, CmdEvent ev, bool finalized)
     {
         var inv = ev.Investigation;
         sb.AppendLine("-- Investigation -----------------------------------------");
@@ -307,4 +307,46 @@ public static class EventTextFormatter
 
     private static string Duration(TimeSpan span) =>
         span.TotalMilliseconds < 1000 ? $"{span.TotalMilliseconds:0.#} ms" : $"{span.TotalSeconds:0.###} s";
+
+    /// <summary>
+    /// Builds the human-readable report one logical line at a time. Captured and
+    /// derived values can contain controls, so render them visibly before adding
+    /// the formatter-owned line ending.
+    /// </summary>
+    private sealed class LogTextBuilder
+    {
+        private readonly StringBuilder _builder = new();
+
+        public void AppendLine(string? value)
+        {
+            if (value is not null)
+            {
+                foreach (var ch in value)
+                {
+                    switch (ch)
+                    {
+                        case '\r':
+                            _builder.Append(@"\r");
+                            break;
+                        case '\n':
+                            _builder.Append(@"\n");
+                            break;
+                        case '\t':
+                            _builder.Append(@"\t");
+                            break;
+                        default:
+                            if (char.IsControl(ch) || ch is '\u2028' or '\u2029')
+                                _builder.Append(@"\u").Append(((int)ch).ToString("X4"));
+                            else
+                                _builder.Append(ch);
+                            break;
+                    }
+                }
+            }
+
+            _builder.AppendLine();
+        }
+
+        public override string ToString() => _builder.ToString();
+    }
 }

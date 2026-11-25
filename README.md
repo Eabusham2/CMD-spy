@@ -277,17 +277,17 @@ By default, CMD-spy writes to:
 
 ```
 %ProgramData%\CmdSpy\logs\
-    cmdspy-YYYYMMDD.jsonl   one JSON object per line (machine-readable)
-    cmdspy-YYYYMMDD.log     formatted, human-readable blocks
+    cmdspy-YYYYMMDD.jsonl   canonical record, one JSON object per line
+    cmdspy-YYYYMMDD.log     derived, human-readable blocks
 ```
 
-Files roll by date. The `.jsonl` file writes a full object when a popup is first
-captured, then re-writes the full object each time it gains detail (a child
-process, a new connection, or its exit + lifetime). Keep the **last line per
-event `id`** to get the complete, final record (including its `investigation`).
-The `.log` file gets a block when the popup is first seen and a finalized block
-— with the full investigation — once it has exited and been analysed. Both files
-can be read while CMD-spy is writing them.
+Files roll by date. The canonical `.jsonl` file writes a full object when a
+popup is first captured, then re-writes the full object each time it gains detail
+(a child process, a new connection, or its exit + lifetime). Keep the **last line
+per event `id`** to get the complete, final record (including its `investigation`).
+The derived `.log` file gets a block when the popup is first seen and a finalized
+block — with the full investigation — once it has exited and been analysed. Both
+files can be read while CMD-spy is writing them.
 
 ### Example `.log` entry
 

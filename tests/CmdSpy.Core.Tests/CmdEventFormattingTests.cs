@@ -136,6 +136,29 @@ public class CmdEventFormattingTests
     }
 
     [Fact]
+    public void Format_EncodesControlsWithoutCreatingLogLines()
+    {
+        var ev = new CmdEvent
+        {
+            ProcessName = "cmd.exe\r\n  User              : forged",
+            ImagePath = "C:\\Windows\\cmd.exe\tforged",
+            UserName = "alice\u001b[2J",
+            CommandLine = "cmd /c echo first\n-- Task info --\u0085next\u2028last"
+        };
+
+        var text = EventTextFormatter.Format(ev);
+
+        Assert.Contains(@"cmd.exe\r\n  User              : forged", text);
+        Assert.Contains(@"C:\Windows\cmd.exe\tforged", text);
+        Assert.Contains(@"alice\u001B[2J", text);
+        Assert.Contains(@"first\n-- Task info --\u0085next\u2028last", text);
+        Assert.DoesNotContain("cmd.exe\r\n  User              : forged", text);
+        Assert.DoesNotContain("\u001b", text);
+        Assert.DoesNotContain("\u0085", text);
+        Assert.DoesNotContain("\u2028", text);
+    }
+
+    [Fact]
     public void NetworkConnectionInfo_ToString_OmitsRemoteForListeners()
     {
         var listener = new NetworkConnectionInfo
