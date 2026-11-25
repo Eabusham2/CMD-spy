@@ -97,14 +97,14 @@ internal static class ServiceControl
     public static List<string> Install()
     {
         var log = new List<string>();
+        var binPath = BuildBinPath(InstalledAppPath);
 
         if (GetStatus() is not null)
         {
             StopService(log);
         }
 
-        var exe = CopyToInstallDirectory(log);
-        var binPath = BuildBinPath(exe);
+        CopyToInstallDirectory(log);
 
         var exists = GetStatus() is not null;
         var (code, output) = exists
@@ -220,14 +220,15 @@ internal static class ServiceControl
         return Path.Combine(target, Path.GetFileName(appFile));
     }
 
-    /// <summary>The service command line: <c>"...\CmdSpy.exe" --service</c> (or via the dotnet host for a .dll build).</summary>
+    /// <summary>The service command line: <c>"...\CmdSpy.exe" --service</c>.</summary>
     private static string BuildBinPath(string installedApp)
     {
-        string command;
-        if (installedApp.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
-            command = $"\\\"{Environment.ProcessPath}\\\" \\\"{installedApp}\\\" --service";
-        else
-            command = $"\\\"{installedApp}\\\" --service";
+        var appPath = Path.GetFullPath(installedApp);
+        if (appPath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException(
+                "Run CMD-spy from CmdSpy.exe (not through 'dotnet') to install the boot service.");
+
+        var command = $"\\\"{appPath}\\\" --service";
         return $"\"{command}\"";
     }
 

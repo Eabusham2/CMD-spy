@@ -43,8 +43,19 @@ internal static class Smoke
     {
         var serviceControl = typeof(CmdSpy.App.MainForm).Assembly.GetType("CmdSpy.App.ServiceControl")
             ?? throw new InvalidOperationException("This build has no ServiceControl.");
-        var binPath = (string)serviceControl.GetMethod("BuildBinPath", BindingFlags.NonPublic | BindingFlags.Static)!
-            .Invoke(null, new object[] { appExe })!;
+        var buildBinPath = serviceControl.GetMethod("BuildBinPath", BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new InvalidOperationException("This build has no service command builder.");
+        try
+        {
+            buildBinPath.Invoke(null, new object[] { Path.ChangeExtension(appExe, ".DLL") });
+            Check("DLL-hosted service registration is rejected", false, "A DLL service command was accepted.");
+        }
+        catch (TargetInvocationException ex) when (ex.InnerException is InvalidOperationException)
+        {
+            Check("DLL-hosted service registration is rejected", true, ex.InnerException.Message);
+        }
+
+        var binPath = (string)buildBinPath.Invoke(null, new object[] { appExe })!;
         var displayName = (string?)serviceControl.GetField("DisplayName")?.GetValue(null) ?? "CMD-spy popup monitor";
         Log($"sc binPath argument built by the app: {binPath}");
 
