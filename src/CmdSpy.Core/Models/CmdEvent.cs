@@ -55,6 +55,10 @@ public sealed class CmdEvent
     /// <summary>Network endpoints owned by this process (best effort snapshot).</summary>
     public List<NetworkConnectionInfo> NetworkConnections { get; set; } = new();
 
+    /// <summary>Connection observations omitted after the per-event sample limit was reached.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public int OmittedNetworkConnectionCount { get; set; }
+
     // ---- Capture metadata -------------------------------------------------
     /// <summary>ETW or WMI — how this sighting was detected.</summary>
     public string CaptureSource { get; set; } = "";

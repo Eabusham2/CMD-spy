@@ -102,6 +102,7 @@ public class CmdEventFormattingTests
             RemotePort = 80,
             State = "ESTABLISHED"
         });
+        ev.OmittedNetworkConnectionCount = 3;
 
         var text = EventTextFormatter.Format(ev);
 
@@ -114,6 +115,7 @@ public class CmdEventFormattingTests
         Assert.Contains(@"HOST\alice", text);
         Assert.Contains("whoami.exe", text);
         Assert.Contains("10.0.0.1:80", text);
+        Assert.Contains("3 additional connection observations omitted", text);
     }
 
     [Fact]

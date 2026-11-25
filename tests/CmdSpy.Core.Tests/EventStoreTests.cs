@@ -105,6 +105,7 @@ public class EventStoreTests : IDisposable
             State = "ESTABLISHED",
             OwningPid = 1234
         });
+        ev.OmittedNetworkConnectionCount = 3;
         store.AppendUpdate(ev, "child-process");
 
         var read = store.ReadToday().Single();
@@ -114,6 +115,7 @@ public class EventStoreTests : IDisposable
         Assert.Single(read.NetworkConnections);
         Assert.Equal(443, read.NetworkConnections[0].RemotePort);
         Assert.Equal("ESTABLISHED", read.NetworkConnections[0].State);
+        Assert.Equal(3, read.OmittedNetworkConnectionCount);
     }
 
     [Fact]

@@ -105,6 +105,8 @@ public static class EventTextFormatter
                 sb.AppendLine($"  * {conn}{owner}{live}");
             }
         }
+        if (ev.OmittedNetworkConnectionCount > 0)
+            sb.AppendLine($"  ({ev.OmittedNetworkConnectionCount} additional connection observations omitted at the sample limit)");
 
         AppendInvestigation(sb, ev, finalized);
 

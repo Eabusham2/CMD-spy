@@ -18,6 +18,11 @@ namespace CmdSpy.Core;
 /// </summary>
 public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
 {
+    // Network events are attacker-influenced and each retained endpoint is
+    // included in full-event snapshots. Keep both memory and persistence work
+    // bounded for the lifetime of one captured event.
+    internal const int MaxNetworkConnectionsPerEvent = 256;
+
     private readonly CmdSpyOptions _options;
     private readonly EventStore _store;
     private IProcessWatcher? _watcher;
@@ -339,7 +344,7 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
 
         // Networking snapshot.
         if (_options.CaptureNetwork)
-            ev.NetworkConnections = NetworkInspector.GetConnectionsForPid(e.ProcessId);
+            ApplyNetworkSnapshot(ev, NetworkInspector.GetConnectionsForPid(e.ProcessId));
 
         _active[e.ProcessId] = ev;
         EvictStaleTracking(e.TimestampUtc);
@@ -414,7 +419,7 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
             {
                 var conns = NetworkInspector.GetConnectionsForPid(parentEvent.ProcessId);
                 if (conns.Count > parentEvent.NetworkConnections.Count)
-                    parentEvent.NetworkConnections = conns;
+                    ApplyNetworkSnapshot(parentEvent, conns);
             }
         }
 
@@ -575,15 +580,51 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
 
     private void AddConnection(CmdEvent target, NetworkConnectionInfo connection)
     {
-        bool added;
+        bool added = false;
+        bool firstOmission = false;
         lock (target)
         {
-            added = !target.NetworkConnections.Any(c => SameEndpoint(c, connection));
-            if (added) target.NetworkConnections.Add(connection);
+            if (target.NetworkConnections.Any(c => SameEndpoint(c, connection))) return;
+
+            if (target.NetworkConnections.Count >= MaxNetworkConnectionsPerEvent)
+            {
+                firstOmission = target.OmittedNetworkConnectionCount <= 0;
+                AddOmittedNetworkConnections(target, 1);
+            }
+            else
+            {
+                target.NetworkConnections.Add(connection);
+                added = true;
+            }
         }
-        if (!added) return;
-        _store.AppendUpdate(target, "network");
+
+        // Persist the bounded samples and the first truncation marker. Later
+        // omissions update only the fixed-size aggregate until another normal
+        // snapshot (for example exit) is written.
+        if (!added && !firstOmission) return;
+        _store.AppendUpdate(target, added ? "network" : "network-limit");
         EventUpdated?.Invoke(this, target);
+    }
+
+    private static void ApplyNetworkSnapshot(CmdEvent target, List<NetworkConnectionInfo> connections)
+    {
+        if (connections.Count <= MaxNetworkConnectionsPerEvent)
+        {
+            target.NetworkConnections = connections;
+            return;
+        }
+
+        target.NetworkConnections = connections.Take(MaxNetworkConnectionsPerEvent).ToList();
+        AddOmittedNetworkConnections(target, connections.Count - MaxNetworkConnectionsPerEvent);
+    }
+
+    private static void AddOmittedNetworkConnections(CmdEvent target, int count)
+    {
+        if (count <= 0) return;
+        var current = Math.Max(0, target.OmittedNetworkConnectionCount);
+        target.OmittedNetworkConnectionCount = count >= int.MaxValue - current
+            ? int.MaxValue
+            : current + count;
     }
 
     /// <summary>True if the connection happened while that (now exited) process was alive.</summary>

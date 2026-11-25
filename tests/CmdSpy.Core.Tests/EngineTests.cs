@@ -146,6 +146,44 @@ public class EngineTests : IDisposable
         Assert.Equal(2, live.Count);
         Assert.Contains(live, c => c.OwningPid == Cmd);
         Assert.Contains(live, c => c.OwningPid == Ping);
+        Assert.Equal(0, captured.OmittedNetworkConnectionCount);
+    }
+
+    [Fact]
+    public void NetworkSamplesAndPersistenceStayBoundedUnderEndpointChurn()
+    {
+        using var engine = NewEngine(network: true);
+        CmdEvent? captured = null;
+        engine.EventCaptured += (_, ev) => captured = ev;
+        var t = DateTimeOffset.UtcNow;
+
+        LaunchChain(t);
+        _watcher.Started(Cmd, Updater, "cmd.exe", "cmd.exe /c network-tool", t.AddMilliseconds(1));
+
+        const int omitted = 50;
+        for (var i = 0; i < CmdSpyEngine.MaxNetworkConnectionsPerEvent + omitted; i++)
+        {
+            engine.OnConnectionObserved(Cmd, new NetworkConnectionInfo
+            {
+                Protocol = "TCP",
+                LocalAddress = "10.0.0.2",
+                LocalPort = 40_000 + i,
+                RemoteAddress = "93.184.216.34",
+                RemotePort = 443,
+                State = "CONNECT",
+                OwningPid = Cmd,
+                Source = "ETW",
+                ObservedAtUtc = t.AddMilliseconds(2 + i)
+            });
+        }
+
+        Assert.NotNull(captured);
+        Assert.Equal(CmdSpyEngine.MaxNetworkConnectionsPerEvent, captured!.NetworkConnections.Count);
+        Assert.Equal(omitted, captured.OmittedNetworkConnectionCount);
+
+        // Initial capture, one update per retained sample, and one truncation marker.
+        Assert.Equal(CmdSpyEngine.MaxNetworkConnectionsPerEvent + 2,
+            File.ReadLines(engine.Store.CurrentJsonlPath).Count());
     }
 
     [Fact]
