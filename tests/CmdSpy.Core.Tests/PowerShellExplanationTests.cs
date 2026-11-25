@@ -207,4 +207,63 @@ public class PowerShellExplanationTests
 
         Assert.Equal(canBeLow ? RiskLevel.Low : RiskLevel.Unknown, risk.Level);
     }
+
+    [Theory]
+    [InlineData(@"$projection = @{Name='X';Expression={Set-Content C:\x y}}; Get-Process | Select-Object $projection")]
+    [InlineData(@"$key = {Set-Content C:\x y; $_.Name}; Get-Process | Sort-Object $key")]
+    [InlineData("Get-Process | Select-Object -Property $projection")]
+    [InlineData("Get-Process | Select-Object -Property:$projection")]
+    [InlineData("Get-Process | Select-Object Name,$projection")]
+    [InlineData("Get-Process | Select-Object -Unique $projection")]
+    [InlineData("Get-Process | Select-Object @{Name='X';Expression=$action}")]
+    [InlineData("Get-Process | Sort-Object -Descending $key")]
+    [InlineData("Get-Process | Group-Object -Property $key")]
+    [InlineData("Get-Process | Group-Object -NoElement $key")]
+    [InlineData("Get-Process | Measure-Object -Property $projection")]
+    [InlineData("Get-Process | Measure-Object -Sum $projection")]
+    [InlineData("Get-Process | Format-Table -GroupBy $grouping")]
+    [InlineData("Get-Process | Format-Table -AutoSize $projection")]
+    [InlineData("Get-Process | Format-List -GroupBy:$grouping")]
+    [InlineData("Get-Process | Format-Wide -Property $projection")]
+    public void DynamicCalculatedProperties_AreUnknownWithoutClaimingStoredCodeRan(string script)
+    {
+        var explanation = Explain(script);
+
+        Assert.Null(explanation.IsReadOnly);
+        Assert.Contains(Effects.Unknown, explanation.Effects);
+        Assert.DoesNotContain(Effects.WritesFiles, explanation.Effects);
+        var risk = RiskAssessor.Assess(new RiskInput
+        {
+            Explanation = explanation,
+            Launcher = new ProcessInfo { ProcessId = 123, ProcessName = "signed-launcher.exe" },
+            Signatures = new[]
+            {
+                new SignatureInfo { Role = "this process", Status = SignatureStatus.Valid, Publisher = "Microsoft" },
+                new SignatureInfo { Role = "launcher", Status = SignatureStatus.Valid, Publisher = "Trusted publisher" }
+            }
+        });
+        Assert.Equal(RiskLevel.Unknown, risk.Level);
+    }
+
+    [Theory]
+    [InlineData("Get-Process | Select-Object Name,Id")]
+    [InlineData("Get-Process | Select-Object -Property @('Name','Id')")]
+    [InlineData("Get-Process | Select-Object @{Name='X';Expression={$_.Name}}")]
+    [InlineData("Get-Process | Select-Object @{N=$label;E={$_.Name}}")]
+    [InlineData("Get-Process | Sort-Object -Descending Name")]
+    [InlineData("Get-Process | Sort-Object -Property @{Expression='Name';Descending=$true}")]
+    [InlineData("Get-Process | Group-Object -NoElement Name")]
+    [InlineData("Get-Process | Measure-Object -Sum CPU")]
+    [InlineData("Get-Process | Format-Table -AutoSize Name,Id")]
+    [InlineData("Get-Process | Format-List -GroupBy Name")]
+    [InlineData("Get-Process | Format-Wide -Property Name")]
+    [InlineData("Select-Object -InputObject $items -Property Name")]
+    [InlineData(@"$projection = @{Name='X';Expression={Set-Content C:\x y}}; Write-Output $projection")]
+    public void LiteralPropertiesAndUninvokedDefinitions_StayReadOnly(string script)
+    {
+        var explanation = Explain(script);
+
+        Assert.True(explanation.IsReadOnly);
+        Assert.DoesNotContain(Effects.WritesFiles, explanation.Effects);
+    }
 }

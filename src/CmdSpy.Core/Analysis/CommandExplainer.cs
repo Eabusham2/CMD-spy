@@ -887,6 +887,13 @@ public static class CommandExplainer
                     "uses a dynamically supplied script block", null, Effects.Unknown));
             }
 
+            if (UsesUnresolvedCalculatedProperty(command, commandName))
+            {
+                AddEvidence(new Step(
+                    $"{commandName} receives a property or grouping definition whose callback behavior is unknown: {Shorten(command.Extent.Text, 120)}.",
+                    "uses an unresolved property or grouping callback", null, Effects.Unknown));
+            }
+
             var canonical = PsAliases.TryGetValue(commandName, out var alias) ? alias : commandName;
             // Their original descriptions are already present, and the walk
             // checks each executed callback separately below.
@@ -1013,6 +1020,61 @@ public static class CommandExplainer
         };
         return invoked == true ? ScriptBlockUsage.Invoked : invoked == false ? ScriptBlockUsage.Data : ScriptBlockUsage.Unknown;
     }
+
+    private static bool UsesUnresolvedCalculatedProperty(CommandAst command, string commandName)
+    {
+        var canonical = PsAliases.TryGetValue(commandName, out var alias) ? alias : commandName;
+        if (canonical.ToLowerInvariant() is not ("select-object" or "sort-object" or "group-object" or
+            "measure-object" or "format-table" or "format-list" or "format-wide")) return false;
+
+        var elements = command.CommandElements;
+        for (int i = 1; i < elements.Count; i++)
+        {
+            if (elements[i] is CommandParameterAst parameter)
+            {
+                bool callback = IsParameterPrefix(parameter.ParameterName, "Property", "GroupBy");
+                if (!callback && (IsPowerShellSwitch(parameter.ParameterName) ||
+                    IsParameterPrefix(parameter.ParameterName,
+                        "Unique", "Wait", "Descending", "Stable", "CaseSensitive",
+                        "NoElement", "AsHashTable", "AsString", "Sum", "Average", "Maximum",
+                        "Minimum", "StandardDeviation", "AllStats", "Line", "Word", "Character",
+                        "IgnoreWhiteSpace", "AutoSize", "Wrap", "HideTableHeaders", "Force",
+                        "ShowError", "DisplayError", "RepeatHeader"))) continue;
+
+                Ast? value = parameter.Argument;
+                if (value is null && i + 1 < elements.Count && elements[i + 1] is not CommandParameterAst)
+                    value = elements[++i];
+                if (callback && !IsVisiblePropertyDefinition(value)) return true;
+            }
+            else if (!IsVisiblePropertyDefinition(elements[i]))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static bool IsVisiblePropertyDefinition(Ast? value) => value switch
+    {
+        // A literal name or string is data; a visible callback is checked by
+        // the execution-aware AST walk. Variables may instead hold callbacks.
+        ConstantExpressionAst or ExpandableStringExpressionAst => true,
+        ScriptBlockExpressionAst => true,
+        ArrayLiteralAst array => array.Elements.All(IsVisiblePropertyDefinition),
+        ArrayExpressionAst array => IsVisiblePropertyDefinition(array.SubExpression),
+        ParenExpressionAst parens => IsVisiblePropertyDefinition(parens.Pipeline),
+        StatementBlockAst block => block.Statements.All(IsVisiblePropertyDefinition),
+        PipelineAst pipeline => pipeline.PipelineElements.Count == 1 &&
+            IsVisiblePropertyDefinition(pipeline.PipelineElements[0]),
+        CommandExpressionAst expression => IsVisiblePropertyDefinition(expression.Expression),
+        HashtableAst table => table.KeyValuePairs.All(pair =>
+            pair.Item1 is StringConstantExpressionAst key &&
+            (IsParameterPrefix(key.Value, "Expression")
+                ? IsVisiblePropertyDefinition(pair.Item2)
+                : IsParameterPrefix(key.Value, "Name", "Label", "Width", "Alignment", "FormatString",
+                    "Depth", "Ascending", "Descending"))),
+        _ => false
+    };
 
     private static bool UsesUnresolvedScriptBlock(CommandAst command, string commandName)
     {
