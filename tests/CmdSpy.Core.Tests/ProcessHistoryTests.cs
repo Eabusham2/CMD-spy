@@ -45,6 +45,33 @@ public class ProcessHistoryTests
     }
 
     [Fact]
+    public void LiveStartReplacesTheStartupSnapshotCopyOfTheSameProcess()
+    {
+        // The start-up snapshot listed the popup before its live start event
+        // arrived, and the two clocks differ by a few milliseconds.
+        var cache = new ProcessCache();
+        cache.Seed(new[]
+        {
+            new ProcessRecord
+            {
+                ProcessId = 900, ParentProcessId = 100, Name = "cmd.exe",
+                ImagePath = @"C:\Windows\System32\cmd.exe", CommandLine = "cmd.exe /c echo hi",
+                StartTimeUtc = T0.AddMilliseconds(4), Source = "snapshot"
+            }
+        });
+        cache.RecordStart(Start(900, 100, "cmd.exe", T0, "cmd.exe /c echo hi"));
+
+        Assert.Equal(1, cache.Count);
+        Assert.True(cache.IsIncarnationAliveAt(900, T0, T0.AddMilliseconds(10)));
+        Assert.NotNull(cache.TryGetUnambiguousIncarnation(900, T0));
+
+        var stopped = cache.RecordStopAndGet(Stop(900, T0.AddMilliseconds(20)));
+        Assert.Equal(T0, stopped!.StartTimeUtc);
+        Assert.Equal(@"C:\Windows\System32\cmd.exe", stopped.ImagePath);   // kept from the snapshot
+        Assert.Empty(cache.FindRunningByName("cmd.exe"));                    // no leftover "running" copy
+    }
+
+    [Fact]
     public void RecycledPidResolvesToTheIncarnationAliveAtTheTime()
     {
         var cache = new ProcessCache();

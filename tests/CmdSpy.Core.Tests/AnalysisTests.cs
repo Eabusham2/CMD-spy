@@ -344,6 +344,40 @@ public class AnalysisTests
     }
 
     [Fact]
+    public void Risk_SummaryNamesWhatStillNeedsVerification()
+    {
+        var launcher = Launcher();
+        RiskAssessment Assess(string command, bool launcherSigned) => RiskAssessor.Assess(new RiskInput
+        {
+            Findings = Detect(command),
+            Explanation = CommandExplainer.Explain(CommandParser.Parse(command)),
+            ProcessName = "powershell.exe",
+            Ancestry = new[] { launcher },
+            AncestryComplete = true,
+            Launcher = launcher,
+            Signatures = launcherSigned
+                ? new[] { Signed("this process", "Microsoft Windows"), Signed("parent, launcher", "ASUSTeK COMPUTER INC.") }
+                : new[] { Signed("this process", "Microsoft Windows") }
+        });
+        const string changes = @"powershell -c Set-Content C:\x y";
+
+        // A read-only command from an unverified launcher: the launcher is what's left to check.
+        var readOnly = Assess(AsusQuery, launcherSigned: false);
+        Assert.Equal(RiskLevel.Unknown, readOnly.Level);
+        Assert.EndsWith(" The program that launched it still needs verification.", readOnly.Summary);
+
+        // A command that changes things: its effect needs checking too.
+        var both = Assess(changes, launcherSigned: false);
+        Assert.Equal(RiskLevel.Unknown, both.Level);
+        Assert.Contains("The program that launched it still needs verification, and so does the command's effect.", both.Summary);
+
+        // Verified launcher and program: only the command's effect is left.
+        var effectOnly = Assess(changes, launcherSigned: true);
+        Assert.Equal(RiskLevel.Unknown, effectOnly.Level);
+        Assert.Contains("The program that launched it checked out, but the command's effect still needs verification.", effectOnly.Summary);
+    }
+
+    [Fact]
     public void Risk_UnsignedLauncherKeepsTheVerdictOpen()
     {
         var parsed = CommandParser.Parse(AsusQuery);

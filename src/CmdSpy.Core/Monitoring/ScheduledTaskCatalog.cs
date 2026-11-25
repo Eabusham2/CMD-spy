@@ -240,19 +240,20 @@ public sealed class ScheduledTaskCatalog
     /// <summary>
     /// Registered tasks whose action would start this program with these
     /// arguments, best match first. A score of 95 means path and arguments match.
+    /// Disabled tasks are left out unless <paramref name="includeDisabled"/> is set.
     /// </summary>
-    public List<(ScheduledTaskInfo Task, TaskAction Action, int Score)> Match(string? imagePath, string? commandLine) =>
-        Match(GetTasks(), imagePath, commandLine);
+    public List<(ScheduledTaskInfo Task, TaskAction Action, int Score)> Match(string? imagePath, string? commandLine, bool includeDisabled = false) =>
+        Match(GetTasks(), imagePath, commandLine, includeDisabled);
 
     public static List<(ScheduledTaskInfo Task, TaskAction Action, int Score)> Match(
-        IEnumerable<ScheduledTaskInfo> tasks, string? imagePath, string? commandLine)
+        IEnumerable<ScheduledTaskInfo> tasks, string? imagePath, string? commandLine, bool includeDisabled = false)
     {
         var results = new List<(ScheduledTaskInfo, TaskAction, int)>();
         var processFile = CommandLineTokenizer.FileNameOf(imagePath ?? FirstToken(commandLine) ?? "");
         if (processFile.Length == 0) return results;
         var normalizedCommand = NormalizeSpace(commandLine);
 
-        foreach (var task in tasks.Where(t => t.Enabled))
+        foreach (var task in tasks.Where(t => includeDisabled || t.Enabled))
         {
             foreach (var action in task.Actions.Where(a => a.Kind == "Exec" && !string.IsNullOrWhiteSpace(a.Command)))
             {

@@ -1313,10 +1313,13 @@ public static class CommandExplainer
             return new Step("Loads a .NET program into memory (can run code that never touches the disk).", "loads code into memory", false, Effects.RunsDynamicCode);
         if (Regex.IsMatch(text, @"\[(System\.)?Diagnostics\.Process\]::Start\s*\(", Opts))
             return new Step($"Starts a program: {Shorten(text, 140)}", "starts a program", false, Effects.LaunchesPrograms);
-        if (Regex.IsMatch(text, @"\[(System\.)?IO\.File\]::(WriteAll\w*|AppendAll\w*|Copy|Move|Delete|Create)\s*\(", Opts))
+        if (Regex.IsMatch(text, @"\[(System\.)?IO\.File\]::(WriteAll\w*|AppendAll\w*|AppendText|CreateText|OpenWrite|Replace|Copy|Move|Delete|Create)\s*\(", Opts))
             return new Step($"Writes/changes a file through .NET: {Shorten(text, 140)}", "writes a file", false, Effects.WritesFiles);
-        if (Regex.IsMatch(text, @"\[(System\.)?IO\.File\]::(ReadAll\w*|Exists|OpenRead)\s*\(", Opts))
+        if (Regex.IsMatch(text, @"\[(System\.)?IO\.File\]::(ReadAll\w*|ReadLines|Exists|OpenRead|OpenText)\s*\(", Opts))
             return new Step($"Reads a file through .NET: {Shorten(text, 140)}", "reads a file", true, Effects.ReadsFiles);
+        // File.Open can read or write depending on its mode, so it is named but not assumed read-only.
+        if (Regex.IsMatch(text, @"\[(System\.)?IO\.File\]::Open\s*\(", Opts))
+            return new Step($"Opens a file through .NET (it may read or write, depending on the mode): {Shorten(text, 140)}", "opens a file", null, Effects.Unknown);
         if (Regex.IsMatch(text, @"\[(System\.)?Convert\]::FromBase64String\s*\(", Opts))
             return new Step("Decodes Base64 data (often used to unpack a hidden payload).", "decodes Base64 data", true, Effects.DataProcessing);
         return null;

@@ -137,7 +137,21 @@ public sealed class ProcessCache
 
         lock (_gate)
         {
-            InsertSorted(ListFor(e.ProcessId), record);
+            var list = ListFor(e.ProcessId);
+            // A process that started just before the start-up snapshot can reach
+            // it before its own live start event does. That snapshot copy is the
+            // same incarnation: replace it, so one process never has two
+            // "running" records (which would defeat the exact PID-reuse checks).
+            int seeded = list.FindIndex(r => r.Source == "snapshot" && r.ExitTimeUtc is null &&
+                                             Math.Abs((r.StartTimeUtc - record.StartTimeUtc).TotalSeconds) < 1);
+            if (seeded >= 0)
+            {
+                record.ImagePath ??= list[seeded].ImagePath;
+                record.CommandLine ??= list[seeded].CommandLine;
+                list.RemoveAt(seeded);
+                _count--;
+            }
+            InsertSorted(list, record);
             _count++;
             if (++_writesSincePrune >= 512)
             {

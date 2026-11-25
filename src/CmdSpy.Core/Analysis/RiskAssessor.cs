@@ -154,7 +154,12 @@ public static class RiskAssessor
                 $"Low risk based on the evidence collected: {(input.Explanation?.IsReadOnly == true ? "the command only reads information, " : "")}it was launched by {launcherName} (signature verified) and the program itself is genuine. This is not proof that the computer is clean.",
             _ => (hasMediumOrWorse ? $"Some indicators ({Join(topReasons)}) but not enough evidence to judge. " : "No suspicious indicators were found in the command itself, but there isn't enough evidence to judge it. ") +
                  (result.Unknowns.FirstOrDefault() ?? "") +
-                 " The command's effect or launch context still needs verification."
+                 (!hasMediumOrWorse && launcherVerified && processVerified
+                     // Only the command's effect kept this from Low (it isn't read-only).
+                     ? " The program that launched it checked out, but the command's effect still needs verification."
+                     : input.Explanation?.IsReadOnly == true
+                         ? " The program that launched it still needs verification."
+                         : " The program that launched it still needs verification, and so does the command's effect.")
         };
 
         return result;

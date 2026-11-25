@@ -182,8 +182,10 @@ public class PowerShellExplanationTests
     public void DotNetFileOpen_OnlyTheExplicitReadVariantCanBeReadOnly()
     {
         Assert.True(Explain(@"[IO.File]::OpenRead('C:\x')").IsReadOnly);
+        Assert.True(Explain(@"[IO.File]::OpenText('C:\x')").IsReadOnly);
         Assert.Null(Explain(@"[IO.File]::Open('C:\x', 'Create')").IsReadOnly);
-        Assert.Null(Explain(@"[IO.File]::OpenWrite('C:\x')").IsReadOnly);
+        Assert.False(Explain(@"[IO.File]::OpenWrite('C:\x')").IsReadOnly);
+        Assert.Contains(Effects.WritesFiles, Explain(@"[IO.File]::OpenWrite('C:\x')").Effects);
     }
 
     [Theory]

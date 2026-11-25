@@ -78,6 +78,13 @@ public sealed class ScheduledTaskCorrelator
             var host = ancestry[hostIndex];
             var candidates = _catalog.Match(taskProcess.ImagePath, taskProcess.CommandLine);
             var best = UniqueBestMatch(candidates, 50);
+            bool ambiguous = best is null && candidates.Any(candidate => candidate.Score >= 50);
+            bool disabledTask = false;
+            if (best is null && !ambiguous)
+            {
+                best = UniqueDisabledMatch(taskProcess, 50);
+                disabledTask = best is not null;
+            }
             HistoryNote(notes);
 
             if (best is { } match)
@@ -85,9 +92,10 @@ public sealed class ScheduledTaskCorrelator
                 return new ScheduledTaskMatch
                 {
                     TaskPath = match.Task.Path,
-                    Confidence = sharedHost ? TaskConfidence.Possible : TaskConfidence.Likely,
+                    Confidence = sharedHost || disabledTask ? TaskConfidence.Possible : TaskConfidence.Likely,
                     Evidence = $"{host.ProcessName} (PID {host.ProcessId}, the Task Scheduler{(sharedHost ? " — shared service host" : "")}) started " +
-                               $"{taskProcess.ProcessName} (PID {taskProcess.ProcessId}), and this task's action runs that exact {(match.Score >= 70 ? "command" : "program")}.",
+                               $"{taskProcess.ProcessName} (PID {taskProcess.ProcessId}), and this task's action runs that exact {(match.Score >= 70 ? "command" : "program")}." +
+                               (disabledTask ? DisabledNote : ""),
                     MatchedProcessId = taskProcess.ProcessId,
                     Command = match.Action.Command,
                     Arguments = match.Action.Arguments,
@@ -98,7 +106,6 @@ public sealed class ScheduledTaskCorrelator
                 };
             }
 
-            bool ambiguous = candidates.Any(candidate => candidate.Score >= 50);
             return new ScheduledTaskMatch
             {
                 TaskPath = "",
@@ -118,13 +125,20 @@ public sealed class ScheduledTaskCorrelator
         {
             var candidates = _catalog.Match(member.ImagePath, member.CommandLine);
             var best = UniqueBestMatch(candidates, 90);
+            bool disabledTask = false;
+            if (best is null && !candidates.Any(candidate => candidate.Score >= 90))
+            {
+                best = UniqueDisabledMatch(member, 90);
+                disabledTask = best is not null;
+            }
             if (best is { } match)
             {
                 return new ScheduledTaskMatch
                 {
                     TaskPath = match.Task.Path,
                     Confidence = TaskConfidence.Possible,
-                    Evidence = $"This task runs exactly {member.ProcessName} with these arguments, but the launch chain doesn't show the Task Scheduler — it may have been started another way.",
+                    Evidence = $"This task runs exactly {member.ProcessName} with these arguments, but the launch chain doesn't show the Task Scheduler — it may have been started another way." +
+                               (disabledTask ? DisabledNote : ""),
                     MatchedProcessId = member.ProcessId,
                     Command = match.Action.Command,
                     Arguments = match.Action.Arguments,
@@ -152,16 +166,33 @@ public sealed class ScheduledTaskCorrelator
     internal static (ScheduledTaskInfo Task, TaskAction Action, int Score)? UniqueBestMatch(
         IReadOnlyList<(ScheduledTaskInfo Task, TaskAction Action, int Score)> candidates, int minimumScore)
     {
-        var eligible = candidates.Where(candidate => candidate.Score >= minimumScore).ToList();
+        var eligible = candidates.Where(candidate => candidate.Score >= minimumScore)
+            .OrderByDescending(candidate => candidate.Score)
+            .ToList();
         if (eligible.Count == 0) return null;
 
-        // Similarity cannot authenticate one candidate while another task also clears the threshold.
-        bool oneTask = eligible.Select(candidate => candidate.Task.Path)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Take(2)
-            .Count() == 1;
-        return oneTask ? eligible.OrderByDescending(candidate => candidate.Score).First() : null;
+        // The best-scoring action is the one that matches what actually ran — a
+        // task whose arguments differ couldn't have started this exact command.
+        // But similarity cannot tell apart two different tasks that match
+        // equally well (e.g. a lookalike copying a vendor task's action), so a
+        // tie at the top attributes nothing.
+        var top = eligible[0];
+        bool tie = eligible.Skip(1).Any(candidate => candidate.Score == top.Score &&
+            !candidate.Task.Path.Equals(top.Task.Path, StringComparison.OrdinalIgnoreCase));
+        return tie ? null : top;
     }
+
+    private const string DisabledNote =
+        " The task is disabled now, so it may have been switched off after it ran.";
+
+    /// <summary>
+    /// A task that is disabled now still counts (it may have been switched off
+    /// after it ran) — but only when no enabled task matches, and only as Possible.
+    /// </summary>
+    private (ScheduledTaskInfo Task, TaskAction Action, int Score)? UniqueDisabledMatch(ProcessInfo process, int minimumScore) =>
+        UniqueBestMatch(_catalog.Match(process.ImagePath, process.CommandLine, includeDisabled: true)
+            .Where(candidate => !candidate.Task.Enabled)
+            .ToList(), minimumScore);
 
     private void HistoryNote(List<string> notes)
     {

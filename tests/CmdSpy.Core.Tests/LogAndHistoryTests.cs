@@ -246,7 +246,52 @@ public class LogAndHistoryTests : IDisposable
         Assert.Equal(2, matches.Count);
         Assert.Null(ScheduledTaskCorrelator.UniqueBestMatch(matches, 90));
         Assert.Equal(2, unevenMatches.Count);
-        Assert.Null(ScheduledTaskCorrelator.UniqueBestMatch(unevenMatches, 50));
+        // A task with no arguments couldn't have started this exact command, so
+        // the exact match is still the answer; only equally good matches tie.
+        Assert.Equal(@"\Vendor\Update Checker", ScheduledTaskCorrelator.UniqueBestMatch(unevenMatches, 50)?.Task.Path);
+    }
+
+    private static readonly ProcessInfo AsusPopup = new()
+    {
+        ProcessId = 4321,
+        ProcessName = "powershell.exe",
+        ImagePath = @"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        CommandLine = "powershell.exe -c gwmi win32_process -Filter 'Name=\"asus_framework.exe\"'"
+    };
+
+    private static readonly ProcessInfo[] SchedulerChain =
+    {
+        new() { ProcessId = 1500, ProcessName = "svchost.exe", CommandLine = @"C:\Windows\system32\svchost.exe -k netsvcs -p -s Schedule" }
+    };
+
+    [Fact]
+    public void ScheduledTask_DisabledTaskStillExplainsTheLaunchButOnlyAsPossible()
+    {
+        // Switching the task off after the popup (e.g. while investigating it)
+        // must not make CMD-spy forget which task ran it.
+        var root = Path.Combine(_dir.Path, "Tasks");
+        Directory.CreateDirectory(Path.Combine(root, "Vendor"));
+        File.WriteAllText(Path.Combine(root, "Vendor", "Update Checker"),
+            TaskXml.Replace("<Settings><Enabled>true</Enabled>", "<Settings><Enabled>false</Enabled>"));
+
+        var match = new ScheduledTaskCorrelator(new ScheduledTaskCatalog(root), history: null)
+            .Correlate(AsusPopup, SchedulerChain, DateTimeOffset.UtcNow, new List<string>());
+
+        Assert.NotNull(match);
+        Assert.Equal(@"\Vendor\Update Checker", match!.TaskPath);
+        Assert.Equal(TaskConfidence.Possible, match.Confidence);
+        Assert.False(match.Enabled);
+        Assert.Contains("disabled now", match.Evidence);
+
+        // An enabled task that runs the same command is preferred to it.
+        Directory.CreateDirectory(Path.Combine(root, "ASUS"));
+        File.WriteAllText(Path.Combine(root, "ASUS", "Update Checker"), TaskXml);
+        var enabled = new ScheduledTaskCorrelator(new ScheduledTaskCatalog(root), history: null)
+            .Correlate(AsusPopup, SchedulerChain, DateTimeOffset.UtcNow, new List<string>());
+
+        Assert.Equal(@"\ASUS\Update Checker", enabled!.TaskPath);
+        Assert.Equal(TaskConfidence.Likely, enabled.Confidence);
+        Assert.DoesNotContain("disabled", enabled.Evidence);
     }
 
     // ------------------------------------------------------- history import --
