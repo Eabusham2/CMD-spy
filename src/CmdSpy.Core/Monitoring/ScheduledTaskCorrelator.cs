@@ -76,33 +76,38 @@ public sealed class ScheduledTaskCorrelator
         {
             var taskProcess = hostIndex == 0 ? self : ancestry[hostIndex - 1];
             var host = ancestry[hostIndex];
-            var best = _catalog.Match(taskProcess.ImagePath, taskProcess.CommandLine).FirstOrDefault();
+            var candidates = _catalog.Match(taskProcess.ImagePath, taskProcess.CommandLine);
+            var best = UniqueBestMatch(candidates, 50);
             HistoryNote(notes);
 
-            if (best.Task is not null && best.Score >= 50)
+            if (best is { } match)
             {
                 return new ScheduledTaskMatch
                 {
-                    TaskPath = best.Task.Path,
+                    TaskPath = match.Task.Path,
                     Confidence = sharedHost ? TaskConfidence.Possible : TaskConfidence.Likely,
                     Evidence = $"{host.ProcessName} (PID {host.ProcessId}, the Task Scheduler{(sharedHost ? " — shared service host" : "")}) started " +
-                               $"{taskProcess.ProcessName} (PID {taskProcess.ProcessId}), and this task's action runs that exact {(best.Score >= 70 ? "command" : "program")}.",
+                               $"{taskProcess.ProcessName} (PID {taskProcess.ProcessId}), and this task's action runs that exact {(match.Score >= 70 ? "command" : "program")}.",
                     MatchedProcessId = taskProcess.ProcessId,
-                    Command = best.Action.Command,
-                    Arguments = best.Action.Arguments,
-                    Author = best.Task.Author,
-                    RunAs = best.Task.UserId,
-                    Enabled = best.Task.Enabled,
-                    Triggers = best.Task.TriggerSummary
+                    Command = match.Action.Command,
+                    Arguments = match.Action.Arguments,
+                    Author = match.Task.Author,
+                    RunAs = match.Task.UserId,
+                    Enabled = match.Task.Enabled,
+                    Triggers = match.Task.TriggerSummary
                 };
             }
 
+            bool ambiguous = candidates.Any(candidate => candidate.Score >= 50);
             return new ScheduledTaskMatch
             {
                 TaskPath = "",
                 Confidence = sharedHost ? TaskConfidence.Possible : TaskConfidence.Likely,
                 Evidence = $"{host.ProcessName} (PID {host.ProcessId}) {(sharedHost ? "may be" : "is")} the Task Scheduler and started " +
-                           $"{taskProcess.ProcessName} (PID {taskProcess.ProcessId}), but no registered task's action matches it exactly" +
+                           $"{taskProcess.ProcessName} (PID {taskProcess.ProcessId}), but " +
+                           (ambiguous
+                               ? "multiple registered tasks have plausible matching actions, so none can be uniquely attributed"
+                               : "no registered task's action matches it exactly") +
                            (_catalog.LastError is { } err ? $" ({err})" : "") + ".",
                 MatchedProcessId = taskProcess.ProcessId
             };
@@ -111,25 +116,51 @@ public sealed class ScheduledTaskCorrelator
         // 3) No scheduler in the chain: only an exact action match is worth mentioning.
         foreach (var member in chain.Take(2))
         {
-            var best = _catalog.Match(member.ImagePath, member.CommandLine).FirstOrDefault();
-            if (best.Task is not null && best.Score >= 90)
+            var candidates = _catalog.Match(member.ImagePath, member.CommandLine);
+            var best = UniqueBestMatch(candidates, 90);
+            if (best is { } match)
             {
                 return new ScheduledTaskMatch
                 {
-                    TaskPath = best.Task.Path,
+                    TaskPath = match.Task.Path,
                     Confidence = TaskConfidence.Possible,
                     Evidence = $"This task runs exactly {member.ProcessName} with these arguments, but the launch chain doesn't show the Task Scheduler — it may have been started another way.",
                     MatchedProcessId = member.ProcessId,
-                    Command = best.Action.Command,
-                    Arguments = best.Action.Arguments,
-                    Author = best.Task.Author,
-                    RunAs = best.Task.UserId,
-                    Enabled = best.Task.Enabled,
-                    Triggers = best.Task.TriggerSummary
+                    Command = match.Action.Command,
+                    Arguments = match.Action.Arguments,
+                    Author = match.Task.Author,
+                    RunAs = match.Task.UserId,
+                    Enabled = match.Task.Enabled,
+                    Triggers = match.Task.TriggerSummary
+                };
+            }
+
+            if (candidates.Any(candidate => candidate.Score >= 90))
+            {
+                return new ScheduledTaskMatch
+                {
+                    TaskPath = "",
+                    Confidence = TaskConfidence.Possible,
+                    Evidence = $"Multiple registered tasks run exactly {member.ProcessName} with these arguments, so none can be uniquely attributed.",
+                    MatchedProcessId = member.ProcessId
                 };
             }
         }
         return null;
+    }
+
+    internal static (ScheduledTaskInfo Task, TaskAction Action, int Score)? UniqueBestMatch(
+        IReadOnlyList<(ScheduledTaskInfo Task, TaskAction Action, int Score)> candidates, int minimumScore)
+    {
+        var eligible = candidates.Where(candidate => candidate.Score >= minimumScore).ToList();
+        if (eligible.Count == 0) return null;
+
+        // Similarity cannot authenticate one candidate while another task also clears the threshold.
+        bool oneTask = eligible.Select(candidate => candidate.Task.Path)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(2)
+            .Count() == 1;
+        return oneTask ? eligible.OrderByDescending(candidate => candidate.Score).First() : null;
     }
 
     private void HistoryNote(List<string> notes)

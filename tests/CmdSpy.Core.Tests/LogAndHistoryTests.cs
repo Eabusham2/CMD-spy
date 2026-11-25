@@ -211,14 +211,42 @@ public class LogAndHistoryTests : IDisposable
     {
         var task = ScheduledTaskCatalog.Parse(@"\ASUS\Update Checker", TaskXml)!;
         var other = ScheduledTaskCatalog.Parse(@"\Other\Thing", TaskXml.Replace("powershell.exe", "other.exe"))!;
+        var disabled = ScheduledTaskCatalog.Parse(@"\Disabled\Update Checker",
+            TaskXml.Replace("<Settings><Enabled>true</Enabled>", "<Settings><Enabled>false</Enabled>"))!;
 
-        var matches = ScheduledTaskCatalog.Match(new[] { task, other },
+        var matches = ScheduledTaskCatalog.Match(new[] { task, other, disabled },
             @"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
             "powershell.exe -c gwmi win32_process -Filter 'Name=\"asus_framework.exe\"'");
 
         var best = Assert.Single(matches);
         Assert.Equal(@"\ASUS\Update Checker", best.Task.Path);
         Assert.True(best.Score >= 90);
+        var unique = ScheduledTaskCorrelator.UniqueBestMatch(matches, 90);
+        Assert.True(unique.HasValue);
+        Assert.Equal(@"\ASUS\Update Checker", unique.Value.Task.Path);
+    }
+
+    [Fact]
+    public void ScheduledTask_CompetingMatchesAreAmbiguous()
+    {
+        var vendor = ScheduledTaskCatalog.Parse(@"\Vendor\Update Checker", TaskXml)!;
+        var duplicate = ScheduledTaskCatalog.Parse(@"\User\Lookalike", TaskXml.Replace(
+            "ASUSTeK COMPUTER INC.", "Untrusted User"))!;
+        var lessSpecific = ScheduledTaskCatalog.Parse(@"\User\Broad Lookalike", TaskXml.Replace(
+            "<Arguments>-c gwmi win32_process -Filter 'Name=\"asus_framework.exe\"'</Arguments>",
+            "<Arguments></Arguments>"))!;
+
+        var matches = ScheduledTaskCatalog.Match(new[] { vendor, duplicate },
+            @"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "powershell.exe -c gwmi win32_process -Filter 'Name=\"asus_framework.exe\"'");
+        var unevenMatches = ScheduledTaskCatalog.Match(new[] { vendor, lessSpecific },
+            @"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "powershell.exe -c gwmi win32_process -Filter 'Name=\"asus_framework.exe\"'");
+
+        Assert.Equal(2, matches.Count);
+        Assert.Null(ScheduledTaskCorrelator.UniqueBestMatch(matches, 90));
+        Assert.Equal(2, unevenMatches.Count);
+        Assert.Null(ScheduledTaskCorrelator.UniqueBestMatch(unevenMatches, 50));
     }
 
     // ------------------------------------------------------- history import --

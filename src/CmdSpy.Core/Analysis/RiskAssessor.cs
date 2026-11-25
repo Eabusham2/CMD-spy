@@ -76,16 +76,16 @@ public static class RiskAssessor
             : input.Signatures.FirstOrDefault(s => s.Role.Contains("launcher", StringComparison.OrdinalIgnoreCase));
 
         bool processVerified = processSig?.IsValid == true;
-        bool launcherKnown = input.Launcher is not null || IsIdentifiedTask(input.Task);
+        bool launcherKnown = input.Launcher is not null || IsConfirmedTask(input.Task);
         bool launcherVerified =
             (launcherSig?.IsValid == true) ||
-            (input.Launcher is null && IsIdentifiedTask(input.Task) && input.Task!.TaskPath.StartsWith(@"\Microsoft\", StringComparison.OrdinalIgnoreCase));
+            (input.Launcher is null && IsConfirmedTask(input.Task) && input.Task!.TaskPath.StartsWith(@"\Microsoft\", StringComparison.OrdinalIgnoreCase));
 
         if (processVerified)
             result.LoweringFactors.Add($"{FileName(processSig!.Path)} itself is genuine (validly signed by {processSig.Publisher}).");
         if (launcherSig?.IsValid == true)
             result.LoweringFactors.Add($"The launcher {input.Launcher!.ProcessName} is validly signed by {launcherSig.Publisher}.");
-        if (IsIdentifiedTask(input.Task))
+        if (IsConfirmedTask(input.Task))
             result.LoweringFactors.Add($"Started by the scheduled task {input.Task!.TaskPath} ({input.Task.Confidence.ToLowerInvariant()}{(input.Task.Author is null ? "" : ", author " + input.Task.Author)}).");
         if (input.Explanation?.IsReadOnly == true)
             result.LoweringFactors.Add("The command only reads information — no modification is evident.");
@@ -140,7 +140,7 @@ public static class RiskAssessor
             .Take(3)
             .Select(f => f.Title.ToLowerInvariant())
             .ToList();
-        var launcherName = input.Launcher?.ProcessName ?? (IsIdentifiedTask(input.Task) ? $"the task {input.Task!.TaskPath}" : "the launching program");
+        var launcherName = input.Launcher?.ProcessName ?? (IsConfirmedTask(input.Task) ? $"the task {input.Task!.TaskPath}" : "the launching program");
 
         result.Summary = result.Level switch
         {
@@ -158,9 +158,9 @@ public static class RiskAssessor
         return result;
     }
 
-    private static bool IsIdentifiedTask(ScheduledTaskMatch? task) =>
+    private static bool IsConfirmedTask(ScheduledTaskMatch? task) =>
         task is not null && !string.IsNullOrEmpty(task.TaskPath) &&
-        task.Confidence is TaskConfidence.Confirmed or TaskConfidence.Likely;
+        task.Confidence == TaskConfidence.Confirmed;
 
     private static string Join(List<string> items) => items.Count switch
     {
