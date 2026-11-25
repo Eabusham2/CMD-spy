@@ -10,8 +10,8 @@ namespace CmdSpy.Core.Monitoring;
 /// Works out whether a scheduled task caused a launch, and which one:
 /// <list type="bullet">
 /// <item><b>Confirmed</b> — Task Scheduler's own log (event 129) recorded launching that exact PID.</item>
-/// <item><b>Likely</b> — the Task Scheduler service is in the launch chain and a registered task's action matches the process it started.</item>
-/// <item><b>Possible</b> — a registered task's action matches exactly, but the chain doesn't show the scheduler.</item>
+/// <item><b>Likely</b> — the Task Scheduler service is in the launch chain and a task's full executable and arguments match.</item>
+/// <item><b>Possible</b> — only action similarity is available, or an exact match has a disabled task, shared host, or no scheduler in the chain.</item>
 /// </list>
 /// </summary>
 public sealed class ScheduledTaskCorrelator
@@ -89,12 +89,15 @@ public sealed class ScheduledTaskCorrelator
 
             if (best is { } match)
             {
+                bool exact = match.Score == ScheduledTaskCatalog.ExactActionScore;
                 return new ScheduledTaskMatch
                 {
                     TaskPath = match.Task.Path,
-                    Confidence = sharedHost || disabledTask ? TaskConfidence.Possible : TaskConfidence.Likely,
+                    Confidence = sharedHost || disabledTask || !exact ? TaskConfidence.Possible : TaskConfidence.Likely,
                     Evidence = $"{host.ProcessName} (PID {host.ProcessId}, the Task Scheduler{(sharedHost ? " — shared service host" : "")}) started " +
-                               $"{taskProcess.ProcessName} (PID {taskProcess.ProcessId}), and this task's action runs that exact {(match.Score >= 70 ? "command" : "program")}." +
+                               $"{taskProcess.ProcessName} (PID {taskProcess.ProcessId}), and " +
+                               (exact ? "this task's action runs that exact command."
+                                   : "this task has a similar action, but its complete executable and arguments have not been matched.") +
                                (disabledTask ? DisabledNote : ""),
                     MatchedProcessId = taskProcess.ProcessId,
                     Command = match.Action.Command,
@@ -120,7 +123,7 @@ public sealed class ScheduledTaskCorrelator
             };
         }
 
-        // 3) No scheduler in the chain: only an exact action match is worth mentioning.
+        // 3) No scheduler in the chain: exact actions and the old strong similarity hints remain Possible.
         foreach (var member in chain.Take(2))
         {
             var candidates = _catalog.Match(member.ImagePath, member.CommandLine);
@@ -137,7 +140,10 @@ public sealed class ScheduledTaskCorrelator
                 {
                     TaskPath = match.Task.Path,
                     Confidence = TaskConfidence.Possible,
-                    Evidence = $"This task runs exactly {member.ProcessName} with these arguments, but the launch chain doesn't show the Task Scheduler — it may have been started another way." +
+                    Evidence = (match.Score == ScheduledTaskCatalog.ExactActionScore
+                                   ? $"This task runs exactly {member.ProcessName} with these arguments"
+                                   : $"This task has a similar action for {member.ProcessName}, without a complete executable and argument match") +
+                               ", but the launch chain doesn't show the Task Scheduler — it may have been started another way." +
                                (disabledTask ? DisabledNote : ""),
                     MatchedProcessId = member.ProcessId,
                     Command = match.Action.Command,
@@ -155,7 +161,7 @@ public sealed class ScheduledTaskCorrelator
                 {
                     TaskPath = "",
                     Confidence = TaskConfidence.Possible,
-                    Evidence = $"Multiple registered tasks run exactly {member.ProcessName} with these arguments, so none can be uniquely attributed.",
+                    Evidence = $"Multiple registered tasks have matching or similar actions for {member.ProcessName}, so none can be uniquely attributed.",
                     MatchedProcessId = member.ProcessId
                 };
             }
@@ -171,15 +177,13 @@ public sealed class ScheduledTaskCorrelator
             .ToList();
         if (eligible.Count == 0) return null;
 
-        // The best-scoring action is the one that matches what actually ran — a
-        // task whose arguments differ couldn't have started this exact command.
-        // But similarity cannot tell apart two different tasks that match
-        // equally well (e.g. a lookalike copying a vendor task's action), so a
-        // tie at the top attributes nothing.
-        var top = eligible[0];
-        bool tie = eligible.Skip(1).Any(candidate => candidate.Score == top.Score &&
-            !candidate.Task.Path.Equals(top.Task.Path, StringComparison.OrdinalIgnoreCase));
-        return tie ? null : top;
+        // Only a complete executable and argument match may outrank another task.
+        // Unequal substring/token-overlap scores cannot resolve competing weak matches.
+        var exact = eligible.Where(candidate => candidate.Score == ScheduledTaskCatalog.ExactActionScore).ToList();
+        if (exact.Count > 0) eligible = exact;
+        bool oneTask = eligible.Select(candidate => candidate.Task.Path)
+            .Distinct(StringComparer.OrdinalIgnoreCase).Take(2).Count() == 1;
+        return oneTask ? eligible[0] : null;
     }
 
     private const string DisabledNote =

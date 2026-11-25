@@ -332,7 +332,7 @@ public sealed partial class MainForm : Form
         foreach (var ev in loaded.Where(e => e.Investigation is null).TakeLast(300).ToList())
         {
             if (investigator is not null) investigator.EnqueueBacklog(ev);
-            else OnDemand().EnqueueBacklog(ev);
+            else OnDemand().EnqueueBacklog(ev, OnBacklogCompleted);
         }
     }
 

@@ -223,7 +223,9 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
                 {
                     if (IsSameIncarnation(e.ParentProcessId, parentEvent.TimestampUtc, e.TimestampUtc))
                         direct = parentEvent;
-                    else
+                    else if (e.TimestampUtc >= parentEvent.TimestampUtc)
+                        // A delayed child from an older incarnation cannot
+                        // establish that the currently tracked popup is stale.
                         _active.TryRemove(new KeyValuePair<int, CmdEvent>(e.ParentProcessId, parentEvent));
                 }
 

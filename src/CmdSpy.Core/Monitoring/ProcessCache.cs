@@ -17,6 +17,8 @@ public sealed class ProcessRecord
     /// <summary>When it started (DateTimeOffset.MinValue when unknown).</summary>
     public DateTimeOffset StartTimeUtc { get; init; }
 
+    internal bool StartTimeIsEstimated { get; init; }
+
     public DateTimeOffset? ExitTimeUtc { get; set; }
     public int? ExitCode { get; set; }
     public int SessionId { get; init; } = -1;
@@ -75,11 +77,19 @@ public sealed class ProcessCache
 
     private readonly object _gate = new();
     private readonly Dictionary<int, List<ProcessRecord>> _byPid = new();
+    private readonly Func<int, DateTimeOffset?> _creationTimeLookup;
     private int _count;
     private int _writesSincePrune;
 
     public ProcessCache(TimeSpan? retainExited = null, int maxRecords = 50_000)
+        : this(pid => ProcessImageResolver.TryQueryLive(pid).StartedUtc, retainExited, maxRecords)
     {
+    }
+
+    internal ProcessCache(Func<int, DateTimeOffset?> creationTimeLookup,
+        TimeSpan? retainExited = null, int maxRecords = 50_000)
+    {
+        _creationTimeLookup = creationTimeLookup ?? throw new ArgumentNullException(nameof(creationTimeLookup));
         RetainExited = retainExited ?? TimeSpan.FromHours(6);
         MaxRecords = Math.Max(1_000, maxRecords);
     }
@@ -103,12 +113,17 @@ public sealed class ProcessCache
             foreach (var record in running)
             {
                 var list = ListFor(record.ProcessId);
-                // Skip an incarnation we already know (same PID and start time).
+                // Snapshots carry creation times; live records carry event
+                // timestamps. Near timestamps alone do not establish identity.
                 bool known = false;
                 foreach (var existing in list)
                 {
-                    if (Math.Abs((existing.StartTimeUtc - record.StartTimeUtc).TotalSeconds) < 1)
+                    if (existing.Source == "snapshot"
+                        ? SameCreationTime(existing.StartTimeUtc, record.StartTimeUtc) && CompatibleIdentity(existing, record)
+                        : MatchesSnapshot(record, existing))
                     {
+                        existing.ImagePath ??= record.ImagePath;
+                        existing.CommandLine ??= record.CommandLine;
                         known = true;
                         break;
                     }
@@ -131,6 +146,7 @@ public sealed class ProcessCache
             ImagePath = e.ImagePath,
             CommandLine = e.CommandLine,
             StartTimeUtc = e.TimestampUtc,
+            StartTimeIsEstimated = e.TimestampIsEstimated,
             SessionId = e.SessionId,
             Source = e.Source
         };
@@ -138,12 +154,10 @@ public sealed class ProcessCache
         lock (_gate)
         {
             var list = ListFor(e.ProcessId);
-            // A process that started just before the start-up snapshot can reach
-            // it before its own live start event does. That snapshot copy is the
-            // same incarnation: replace it, so one process never has two
-            // "running" records (which would defeat the exact PID-reuse checks).
-            int seeded = list.FindIndex(r => r.Source == "snapshot" && r.ExitTimeUtc is null &&
-                                             Math.Abs((r.StartTimeUtc - record.StartTimeUtc).TotalSeconds) < 1);
+            // Coalesce an overlapping snapshot only with creation-time proof.
+            // A stale snapshot and a rapid relaunch must remain distinct, even
+            // when their names, parents and event timestamps happen to match.
+            int seeded = list.FindIndex(r => r.Source == "snapshot" && MatchesSnapshot(r, record));
             if (seeded >= 0)
             {
                 record.ImagePath ??= list[seeded].ImagePath;
@@ -160,6 +174,42 @@ public sealed class ProcessCache
             }
         }
         return record;
+    }
+
+    private bool MatchesSnapshot(ProcessRecord snapshot, ProcessRecord observed)
+    {
+        if (snapshot.ExitTimeUtc is not null || observed.ExitTimeUtc is not null ||
+            snapshot.StartTimeUtc == DateTimeOffset.MinValue || observed.StartTimeIsEstimated ||
+            Math.Abs((snapshot.StartTimeUtc - observed.StartTimeUtc).TotalSeconds) >= 1 ||
+            !CompatibleIdentity(snapshot, observed))
+            return false;
+
+        // Query only a possible overlap. The live lookup can itself see a
+        // reused PID, so its creation must match the snapshot and precede the
+        // original start event. Never use the clock-skew allowance as proof.
+        var created = _creationTimeLookup(observed.ProcessId);
+        return created is { } actual && actual <= observed.StartTimeUtc &&
+               SameCreationTime(snapshot.StartTimeUtc, actual);
+    }
+
+    private static bool SameCreationTime(DateTimeOffset left, DateTimeOffset right) =>
+        left != DateTimeOffset.MinValue && right != DateTimeOffset.MinValue &&
+        left.UtcTicks / 10 == right.UtcTicks / 10; // WMI CreationDate has microsecond precision.
+
+    private static bool CompatibleIdentity(ProcessRecord left, ProcessRecord right)
+    {
+        if (left.ProcessId != right.ProcessId ||
+            (left.ParentProcessId > 0 && right.ParentProcessId > 0 && left.ParentProcessId != right.ParentProcessId) ||
+            (left.SessionId >= 0 && right.SessionId >= 0 && left.SessionId != right.SessionId))
+            return false;
+        if (!string.IsNullOrWhiteSpace(left.Name) && !string.IsNullOrWhiteSpace(right.Name) &&
+            !ProcessRoles.Stem(left.Name).Equals(ProcessRoles.Stem(right.Name), StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (ProcessImageResolver.IsRooted(left.ImagePath) && ProcessImageResolver.IsRooted(right.ImagePath) &&
+            !string.Equals(left.ImagePath, right.ImagePath, StringComparison.OrdinalIgnoreCase))
+            return false;
+        return string.IsNullOrWhiteSpace(left.CommandLine) || string.IsNullOrWhiteSpace(right.CommandLine) ||
+               string.Equals(left.CommandLine, right.CommandLine, StringComparison.Ordinal);
     }
 
     /// <summary>Records a process exit against the incarnation that was running.</summary>

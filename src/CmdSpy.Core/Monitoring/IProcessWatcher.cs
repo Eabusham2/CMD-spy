@@ -11,6 +11,7 @@ public sealed class ProcessStartedEventArgs : EventArgs
     public string? ImagePath { get; init; }
     public string? CommandLine { get; init; }
     public DateTimeOffset TimestampUtc { get; init; }
+    internal bool TimestampIsEstimated { get; init; }
     public string Source { get; init; } = "";
 
     /// <summary>Windows session the process started in (-1 if the source doesn't report it).</summary>

@@ -171,6 +171,14 @@ public sealed partial class MainForm
         return _onDemand;
     }
 
+    private void OnBacklogCompleted(CmdEvent ev, Investigation investigation)
+    {
+        // A service verdict received while this automatic pass was queued or
+        // running is authoritative. Manual reanalysis keeps its own handler.
+        if (Investigator.TryApplyBacklogResult(ev, investigation))
+            UiInvoke(() => OnUpdated(ev));
+    }
+
     private void ReanalyzeSelected()
     {
         if (SelectedEvent is not { } ev)

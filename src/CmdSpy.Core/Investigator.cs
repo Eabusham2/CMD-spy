@@ -25,11 +25,18 @@ public sealed class Investigator : IDisposable
     private readonly ScheduledTaskCatalog _taskCatalog;
     private readonly WindowsEventHistory _history;
     private readonly ScheduledTaskCorrelator _tasks;
-    private readonly ConcurrentDictionary<Guid, byte> _queued = new();
-    private readonly ConcurrentQueue<CmdEvent> _backlog = new();
-    private BlockingCollection<CmdEvent>? _queue;
+    private readonly ConcurrentDictionary<Guid, WorkItem> _queued = new();
+    private readonly ConcurrentQueue<WorkItem> _backlog = new();
+    private BlockingCollection<WorkItem>? _queue;
     private Thread? _worker;
     private CancellationTokenSource? _cancel;
+
+    private sealed class WorkItem(CmdEvent ev, bool isBacklog, Action<CmdEvent, Investigation>? completed = null)
+    {
+        public CmdEvent Event { get; } = ev;
+        public bool IsBacklog { get; } = isBacklog;
+        public Action<CmdEvent, Investigation>? Completed { get; } = completed;
+    }
 
     public Investigator(ProcessCache processes, CmdSpyOptions options, SignatureVerifier? signatures = null,
         ScheduledTaskCatalog? taskCatalog = null, WindowsEventHistory? history = null)
@@ -54,7 +61,9 @@ public sealed class Investigator : IDisposable
     /// <summary>Raised on the investigator thread when an analysis finishes.</summary>
     public event Action<CmdEvent, Investigation>? Completed;
 
-    public int Pending => (_queue?.Count ?? 0) + _backlog.Count;
+    // Promoting a backlog item leaves an obsolete token in that queue; count
+    // only the current work items, not those tokens or an analysis in flight.
+    public int Pending => _queued.Count;
     public bool IsRunning => _worker is not null;
 
     /// <summary>True while another analysis pass for this event is waiting in the queue.</summary>
@@ -64,7 +73,7 @@ public sealed class Investigator : IDisposable
     public void Start(System.Threading.Tasks.Task? warmUp = null)
     {
         if (_worker is not null) return;
-        _queue = new BlockingCollection<CmdEvent>(new ConcurrentQueue<CmdEvent>());
+        _queue = new BlockingCollection<WorkItem>(new ConcurrentQueue<WorkItem>());
         _cancel = new CancellationTokenSource();
         var queue = _queue;
         var token = _cancel.Token;
@@ -81,32 +90,64 @@ public sealed class Investigator : IDisposable
         _worker.Start();
     }
 
-    /// <summary>Queues an event for (re-)analysis. Already-queued events are not duplicated.</summary>
+    /// <summary>Queues an event for (re-)analysis, promoting any waiting automatic backlog pass.</summary>
     public void Enqueue(CmdEvent ev)
     {
         if (!_options.InvestigateEvents) return;
         var queue = _queue;
         if (queue is null || queue.IsAddingCompleted) return;
-        if (!_queued.TryAdd(ev.Id, 0)) return;
+        var item = new WorkItem(ev, isBacklog: false);
+        while (!_queued.TryAdd(ev.Id, item))
+        {
+            if (!_queued.TryGetValue(ev.Id, out var waiting)) continue;
+            if (!waiting.IsBacklog) return;
+            if (_queued.TryUpdate(ev.Id, item, waiting)) break;
+        }
         try
         {
-            queue.Add(ev);
+            queue.Add(item);
         }
         catch (InvalidOperationException)
         {
-            _queued.TryRemove(ev.Id, out _);
+            _queued.TryRemove(new KeyValuePair<Guid, WorkItem>(ev.Id, item));
         }
     }
 
     /// <summary>
     /// Queues an older capture (e.g. loaded from today's log without a finished
-    /// analysis) to be analysed when no live capture is waiting.
+    /// analysis) to be analysed when no live capture is waiting. A verdict that
+    /// arrives before the work starts makes this automatic pass unnecessary.
     /// </summary>
-    public void EnqueueBacklog(CmdEvent ev)
+    /// <param name="completed">An optional completion handler for this backlog pass only,
+    /// used instead of <see cref="Completed"/>. A foreground request replaces both the
+    /// waiting backlog pass and this handler.</param>
+    public void EnqueueBacklog(CmdEvent ev, Action<CmdEvent, Investigation>? completed = null)
     {
-        if (!_options.InvestigateEvents || _queue is null || _queue.IsAddingCompleted) return;
-        if (!_queued.TryAdd(ev.Id, 0)) return;
-        _backlog.Enqueue(ev);
+        var queue = _queue;
+        if (!_options.InvestigateEvents || queue is null || queue.IsAddingCompleted) return;
+        lock (ev)
+        {
+            if (ev.Investigation is not null) return;
+        }
+        var item = new WorkItem(ev, isBacklog: true, completed);
+        if (!_queued.TryAdd(ev.Id, item)) return;
+        _backlog.Enqueue(item);
+    }
+
+    /// <summary>
+    /// Applies an automatic GUI backfill only while no verdict has arrived from
+    /// the service or another analysis. The check and assignment share the same
+    /// event lock as LogFollower; this does not write the service's log files.
+    /// Explicit reanalysis deliberately uses its ordinary completion handler.
+    /// </summary>
+    public static bool TryApplyBacklogResult(CmdEvent ev, Investigation investigation)
+    {
+        lock (ev)
+        {
+            if (ev.Investigation is not null) return false;
+            ev.Investigation = investigation;
+            return true;
+        }
     }
 
     /// <summary>Stops accepting work and lets queued analyses finish for up to <paramref name="drainTimeout"/>.</summary>
@@ -127,13 +168,22 @@ public sealed class Investigator : IDisposable
 
     public void Dispose() => Stop(TimeSpan.FromSeconds(1));
 
-    private void Run(BlockingCollection<CmdEvent> queue, CancellationToken token)
+    private void Run(BlockingCollection<WorkItem> queue, CancellationToken token)
     {
-        foreach (var ev in Next(queue, token))
+        foreach (var item in Next(queue, token))
         {
             if (token.IsCancellationRequested) break;
+            var ev = item.Event;
             // Removed before analysing, so a change during analysis queues a fresh pass.
-            _queued.TryRemove(ev.Id, out _);
+            // An obsolete backlog token must not consume its promoted foreground pass.
+            if (!_queued.TryRemove(new KeyValuePair<Guid, WorkItem>(ev.Id, item))) continue;
+            if (item.IsBacklog)
+            {
+                lock (ev)
+                {
+                    if (ev.Investigation is not null) continue;
+                }
+            }
             Investigation investigation;
             try
             {
@@ -146,7 +196,7 @@ public sealed class Investigator : IDisposable
             }
             try
             {
-                Completed?.Invoke(ev, investigation);
+                (item.Completed ?? Completed)?.Invoke(ev, investigation);
             }
             catch
             {
@@ -156,29 +206,29 @@ public sealed class Investigator : IDisposable
     }
 
     /// <summary>Live captures first; the backlog only while nothing live is waiting (and not once stopping).</summary>
-    private IEnumerable<CmdEvent> Next(BlockingCollection<CmdEvent> queue, CancellationToken token)
+    private IEnumerable<WorkItem> Next(BlockingCollection<WorkItem> queue, CancellationToken token)
     {
         while (!token.IsCancellationRequested)
         {
-            CmdEvent? ev;
+            WorkItem? item;
             try
             {
                 bool idleWait = _backlog.IsEmpty || queue.IsAddingCompleted;
-                if (!queue.TryTake(out ev, idleWait ? 250 : 0))
+                if (!queue.TryTake(out item, idleWait ? 250 : 0))
                 {
                     if (queue.IsAddingCompleted)
                     {
                         if (queue.IsCompleted) yield break;
                         continue;
                     }
-                    if (!_backlog.TryDequeue(out ev)) continue;
+                    if (!_backlog.TryDequeue(out item)) continue;
                 }
             }
             catch (ObjectDisposedException)
             {
                 yield break;
             }
-            yield return ev;
+            yield return item;
         }
     }
 

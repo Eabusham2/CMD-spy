@@ -43,6 +43,7 @@ public sealed class WmiProcessWatcher : IProcessWatcher
             int pid = ToInt(ev["ProcessID"]);
             int ppid = ToInt(ev["ParentProcessID"]);
             string name = ev["ProcessName"] as string ?? "";
+            var timestamp = EventTime(ev, out var estimated);
 
             ProcessStarted?.Invoke(this, new ProcessStartedEventArgs
             {
@@ -51,7 +52,8 @@ public sealed class WmiProcessWatcher : IProcessWatcher
                 ProcessName = name,
                 ImagePath = null,
                 CommandLine = null,
-                TimestampUtc = EventTime(ev),
+                TimestampUtc = timestamp,
+                TimestampIsEstimated = estimated,
                 Source = "WMI"
             });
         }
@@ -74,7 +76,7 @@ public sealed class WmiProcessWatcher : IProcessWatcher
             {
                 ProcessId = pid,
                 ExitCode = exit,
-                TimestampUtc = EventTime(ev)
+                TimestampUtc = EventTime(ev, out _)
             });
         }
         catch
@@ -92,8 +94,9 @@ public sealed class WmiProcessWatcher : IProcessWatcher
     /// important for the short-lived processes this tool targets. Falls back to
     /// the current time if the value is missing or malformed.
     /// </summary>
-    private static DateTimeOffset EventTime(ManagementBaseObject ev)
+    private static DateTimeOffset EventTime(ManagementBaseObject ev, out bool estimated)
     {
+        estimated = false;
         try
         {
             var raw = ev["TIME_CREATED"];
@@ -108,6 +111,7 @@ public sealed class WmiProcessWatcher : IProcessWatcher
         {
             // Missing / out-of-range — fall back below.
         }
+        estimated = true;
         return DateTimeOffset.UtcNow;
     }
 

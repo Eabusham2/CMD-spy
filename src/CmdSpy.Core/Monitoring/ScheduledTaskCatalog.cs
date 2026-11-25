@@ -43,6 +43,7 @@ public sealed class ScheduledTaskInfo
 /// </summary>
 public sealed class ScheduledTaskCatalog
 {
+    internal const int ExactActionScore = 100;
     private readonly object _gate = new();
     private readonly TimeSpan _refreshAfter;
     private List<ScheduledTaskInfo>? _tasks;
@@ -239,7 +240,8 @@ public sealed class ScheduledTaskCatalog
 
     /// <summary>
     /// Registered tasks whose action would start this program with these
-    /// arguments, best match first. A score of 95 means path and arguments match.
+    /// arguments, best match first. A score of 100 means the full path and argument sequence match;
+    /// lower scores are compatibility hints, not proof of an exact action.
     /// Disabled tasks are left out unless <paramref name="includeDisabled"/> is set.
     /// </summary>
     public List<(ScheduledTaskInfo Task, TaskAction Action, int Score)> Match(string? imagePath, string? commandLine, bool includeDisabled = false) =>
@@ -249,7 +251,9 @@ public sealed class ScheduledTaskCatalog
         IEnumerable<ScheduledTaskInfo> tasks, string? imagePath, string? commandLine, bool includeDisabled = false)
     {
         var results = new List<(ScheduledTaskInfo, TaskAction, int)>();
-        var processFile = CommandLineTokenizer.FileNameOf(imagePath ?? FirstToken(commandLine) ?? "");
+        var processTokens = CommandLineTokenizer.Tokenize(commandLine);
+        var processPath = NormalizeExecutablePath(imagePath ?? (processTokens.Count > 0 ? processTokens[0].Value : ""));
+        var processFile = CommandLineTokenizer.FileNameOf(processPath);
         if (processFile.Length == 0) return results;
         var normalizedCommand = NormalizeSpace(commandLine);
 
@@ -257,19 +261,23 @@ public sealed class ScheduledTaskCatalog
         {
             foreach (var action in task.Actions.Where(a => a.Kind == "Exec" && !string.IsNullOrWhiteSpace(a.Command)))
             {
-                var actionPath = Expand(action.Command!).Trim().Trim('"');
+                var actionPath = NormalizeExecutablePath(Expand(action.Command!));
                 var actionFile = CommandLineTokenizer.FileNameOf(actionPath);
+                bool samePath = imagePath is not null && ProcessImageResolver.IsRooted(actionPath) &&
+                                actionPath.Equals(processPath, StringComparison.OrdinalIgnoreCase);
                 int score;
-                if (imagePath is not null && ProcessImageResolver.IsRooted(actionPath) &&
-                    actionPath.Equals(imagePath, StringComparison.OrdinalIgnoreCase))
+                if (samePath)
                     score = 50;
                 else if (CmdSpyOptions.Stem(actionFile).Equals(CmdSpyOptions.Stem(processFile), StringComparison.OrdinalIgnoreCase))
                     score = 25;
                 else
                     continue;
 
-                var args = NormalizeSpace(Expand(action.Arguments ?? ""));
-                if (args.Length > 0 && normalizedCommand.Length > 0)
+                var rawArguments = Expand(action.Arguments ?? "");
+                var args = NormalizeSpace(rawArguments);
+                if (samePath && ArgumentsMatch(processTokens, commandLine ?? "", rawArguments, actionFile))
+                    score = ExactActionScore;
+                else if (args.Length > 0 && normalizedCommand.Length > 0)
                 {
                     if (normalizedCommand.Contains(args, StringComparison.OrdinalIgnoreCase)) score += 45;
                     else if (TokenOverlap(args, normalizedCommand) >= 0.6) score += 20;
@@ -291,10 +299,24 @@ public sealed class ScheduledTaskCatalog
         catch { return value; }
     }
 
-    private static string? FirstToken(string? commandLine)
+    private static string NormalizeExecutablePath(string path) =>
+        (ProcessImageResolver.NormalizeKernelPath(path) ?? "").Replace('/', '\\');
+
+    private static bool ArgumentsMatch(IReadOnlyList<CommandToken> processTokens, string commandLine, string arguments, string program)
     {
-        var tokens = CommandLineTokenizer.Tokenize(commandLine);
-        return tokens.Count > 0 ? tokens[0].Value : null;
+        if (processTokens.Count == 0) return false;
+        var stem = CmdSpyOptions.Stem(program);
+        // Shells interpret their raw command tail too: equal Windows argv values
+        // do not prove that different quoting has the same script meaning.
+        if (stem.Equals("cmd", StringComparison.OrdinalIgnoreCase) ||
+            stem.Equals("powershell", StringComparison.OrdinalIgnoreCase) ||
+            stem.Equals("pwsh", StringComparison.OrdinalIgnoreCase))
+            return CommandLineTokenizer.RawAfter(commandLine, processTokens, 0)
+                .Equals(arguments.TrimStart(' ', '\t'), StringComparison.Ordinal);
+
+        return processTokens.Skip(1).Select(token => token.Value).SequenceEqual(
+            CommandLineTokenizer.Tokenize("task.exe " + arguments).Skip(1).Select(token => token.Value),
+            StringComparer.Ordinal); // Payload case and spaces inside a quoted argument can matter.
     }
 
     private static string NormalizeSpace(string? s) =>

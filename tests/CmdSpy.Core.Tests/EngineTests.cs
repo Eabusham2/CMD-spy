@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using CmdSpy.Core.Models;
+using CmdSpy.Core.Monitoring;
 using Xunit;
 
 namespace CmdSpy.Core.Tests;
@@ -166,6 +167,54 @@ public class EngineTests : IDisposable
         Assert.DoesNotContain(newer.NetworkConnections, c => c.LocalPort == 50100);
         Assert.Contains(newer.NetworkConnections, c => c.LocalPort == 50101);
         Assert.DoesNotContain(older.NetworkConnections, c => c.LocalPort == 50101);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void StaleSnapshotActivityCannotAttachToOrEvictTheNewPopup(bool sameProgram)
+    {
+        using var engine = NewEngine(network: true);
+        CmdEvent? captured = null;
+        engine.EventCaptured += (_, ev) => captured = ev;
+        var t = DateTimeOffset.UtcNow;
+        const string command = "cmd.exe /c tools";
+        const string image = @"C:\Windows\System32\cmd.exe";
+        engine.Processes.Seed(new[]
+        {
+            new ProcessRecord
+            {
+                ProcessId = Cmd, ParentProcessId = 0,
+                Name = sameProgram ? "cmd.exe" : "old.exe",
+                ImagePath = sameProgram ? image : @"C:\Old\old.exe",
+                CommandLine = sameProgram ? command : "old.exe",
+                StartTimeUtc = t, Source = "snapshot"
+            }
+        });
+        _watcher.Started(Cmd, 0, "cmd.exe", command, t.AddMilliseconds(500), image);
+
+        NetworkConnectionInfo Connection(int port, int milliseconds) => new()
+        {
+            Protocol = "TCP", LocalPort = port, RemoteAddress = "198.51.100.1",
+            RemotePort = 443, OwningPid = Cmd, Source = "ETW", ObservedAtUtc = t.AddMilliseconds(milliseconds)
+        };
+        engine.OnConnectionObserved(Cmd, Connection(50300, 100));
+        _watcher.Started(Ping, Cmd, "old-child.exe", "old-child.exe", t.AddMilliseconds(100));
+        _watcher.Stopped(Cmd, t.AddMilliseconds(200));
+
+        Assert.NotNull(captured);
+        Assert.Empty(captured!.ChildProcesses);
+        Assert.DoesNotContain(captured.NetworkConnections, c => c.LocalPort == 50300);
+        Assert.Null(captured.ExitedAtUtc);
+
+        _watcher.Started(Grandchild, Cmd, "new-child.exe", "new-child.exe", t.AddMilliseconds(600));
+        engine.OnConnectionObserved(Cmd, Connection(50301, 700));
+        _watcher.Stopped(Cmd, t.AddMilliseconds(900), exitCode: 7);
+
+        Assert.Equal(Grandchild, Assert.Single(captured.ChildProcesses).ProcessId);
+        Assert.Equal(new[] { 50301 }, captured.NetworkConnections.Select(c => c.LocalPort));
+        Assert.Equal(t.AddMilliseconds(900), captured.ExitedAtUtc);
+        Assert.Equal(7, captured.ExitCode);
     }
 
     [Fact]
