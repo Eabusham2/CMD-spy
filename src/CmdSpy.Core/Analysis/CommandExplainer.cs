@@ -1004,7 +1004,8 @@ public static class CommandExplainer
         var parameter = argument is CommandParameterAst attached ? attached.ParameterName : null;
         var index = command.CommandElements.IndexOf(element);
         if (parameter is null && index > 0 && command.CommandElements[index - 1] is CommandParameterAst previous &&
-            !IsPowerShellSwitch(previous.ParameterName)) parameter = previous.ParameterName;
+            previous.Argument is null && !IsPowerShellSwitch(previous.ParameterName) &&
+            !IsCalculatedPropertySwitch(previous.ParameterName, canonical)) parameter = previous.ParameterName;
 
         bool? invoked = canonical.ToLowerInvariant() switch
         {
@@ -1021,11 +1022,25 @@ public static class CommandExplainer
         return invoked == true ? ScriptBlockUsage.Invoked : invoked == false ? ScriptBlockUsage.Data : ScriptBlockUsage.Unknown;
     }
 
+    private static bool IsCalculatedPropertyConsumer(string canonical) =>
+        canonical.ToLowerInvariant() is "select-object" or "sort-object" or "group-object" or
+            "measure-object" or "format-table" or "format-list" or "format-wide";
+
+    // Keep argument scanning and script-block usage classification in agreement:
+    // a positional property after a switch is still an executable callback.
+    private static bool IsCalculatedPropertySwitch(string parameterName, string canonical) =>
+        IsCalculatedPropertyConsumer(canonical) &&
+        IsParameterPrefix(parameterName,
+            "Unique", "Wait", "Descending", "Stable", "CaseSensitive",
+            "NoElement", "AsHashTable", "AsString", "Sum", "Average", "Maximum",
+            "Minimum", "StandardDeviation", "AllStats", "Line", "Word", "Character",
+            "IgnoreWhiteSpace", "AutoSize", "Wrap", "HideTableHeaders", "Force",
+            "ShowError", "DisplayError", "RepeatHeader");
+
     private static bool UsesUnresolvedCalculatedProperty(CommandAst command, string commandName)
     {
         var canonical = PsAliases.TryGetValue(commandName, out var alias) ? alias : commandName;
-        if (canonical.ToLowerInvariant() is not ("select-object" or "sort-object" or "group-object" or
-            "measure-object" or "format-table" or "format-list" or "format-wide")) return false;
+        if (!IsCalculatedPropertyConsumer(canonical)) return false;
 
         var elements = command.CommandElements;
         for (int i = 1; i < elements.Count; i++)
@@ -1034,12 +1049,7 @@ public static class CommandExplainer
             {
                 bool callback = IsParameterPrefix(parameter.ParameterName, "Property", "GroupBy");
                 if (!callback && (IsPowerShellSwitch(parameter.ParameterName) ||
-                    IsParameterPrefix(parameter.ParameterName,
-                        "Unique", "Wait", "Descending", "Stable", "CaseSensitive",
-                        "NoElement", "AsHashTable", "AsString", "Sum", "Average", "Maximum",
-                        "Minimum", "StandardDeviation", "AllStats", "Line", "Word", "Character",
-                        "IgnoreWhiteSpace", "AutoSize", "Wrap", "HideTableHeaders", "Force",
-                        "ShowError", "DisplayError", "RepeatHeader"))) continue;
+                    IsCalculatedPropertySwitch(parameter.ParameterName, canonical))) continue;
 
                 Ast? value = parameter.Argument;
                 if (value is null && i + 1 < elements.Count && elements[i + 1] is not CommandParameterAst)

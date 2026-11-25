@@ -266,4 +266,33 @@ public class PowerShellExplanationTests
         Assert.True(explanation.IsReadOnly);
         Assert.DoesNotContain(Effects.WritesFiles, explanation.Effects);
     }
+
+    [Theory]
+    [InlineData(@"Get-Process | Sort-Object -Descending @{Expression={Set-Content C:\x y}}")]
+    [InlineData(@"Get-Process | Select-Object -Unique @{Name='X';Expression={Set-Content C:\x y}}")]
+    [InlineData(@"Get-Process | Group-Object -NoElement {Set-Content C:\x y}")]
+    [InlineData(@"Get-Process | Measure-Object -Sum {Set-Content C:\x y}")]
+    [InlineData(@"Get-Process | Format-Table -AutoSize @{Name='X';Expression={Set-Content C:\x y}}")]
+    [InlineData(@"Get-Process | Format-List -Force @{Name='X';Expression={Set-Content C:\x y}}")]
+    [InlineData(@"Get-Process | Sort-Object -InputObject:$items {Set-Content C:\x y}")]
+    [InlineData(@"Get-Process | Select-Object -InputObject:$items @{Name='X';Expression={Set-Content C:\x y}}")]
+    [InlineData(@"Get-Process | ForEach-Object -InputObject:$items {Set-Content C:\x y}")]
+    public void PositionalCallbacks_AfterSwitchesOrAttachedArguments_StillReportWrites(string script)
+    {
+        var explanation = Explain(script);
+
+        Assert.False(explanation.IsReadOnly);
+        Assert.Contains(Effects.WritesFiles, explanation.Effects);
+        var risk = RiskAssessor.Assess(new RiskInput
+        {
+            Explanation = explanation,
+            Launcher = new ProcessInfo { ProcessId = 123, ProcessName = "signed-launcher.exe" },
+            Signatures = new[]
+            {
+                new SignatureInfo { Role = "this process", Status = SignatureStatus.Valid, Publisher = "Microsoft" },
+                new SignatureInfo { Role = "launcher", Status = SignatureStatus.Valid, Publisher = "Trusted publisher" }
+            }
+        });
+        Assert.NotEqual(RiskLevel.Low, risk.Level);
+    }
 }
