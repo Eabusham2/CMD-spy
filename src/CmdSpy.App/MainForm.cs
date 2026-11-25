@@ -318,6 +318,22 @@ public sealed partial class MainForm : Form
 
         UpdateCount();
         StartMonitoring();
+        AnalyzeBacklog(_all);
+    }
+
+    /// <summary>
+    /// Captures loaded from today's log that never got a verdict (CMD-spy was
+    /// closed before their analysis finished, or an older version logged them)
+    /// are analysed in the background, after any live popups.
+    /// </summary>
+    private void AnalyzeBacklog(IEnumerable<CmdEvent> loaded)
+    {
+        var investigator = _engine.IsRunning && _follower is null ? _engine.Investigator : null;
+        foreach (var ev in loaded.Where(e => e.Investigation is null).TakeLast(300).ToList())
+        {
+            if (investigator is not null) investigator.EnqueueBacklog(ev);
+            else OnDemand().EnqueueBacklog(ev);
+        }
     }
 
     private void StartMonitoring()

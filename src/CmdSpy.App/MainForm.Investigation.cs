@@ -441,6 +441,7 @@ public sealed partial class MainForm
             _btnStart.Enabled = false;
             _btnStop.Enabled = false;
             RestoreStatusLabel();
+            AnalyzeBacklog(existing);
         }
         catch (Exception ex)
         {

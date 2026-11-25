@@ -390,6 +390,34 @@ public class EngineTests : IDisposable
         Assert.Equal(2, captured!.Investigation!.Revision);
     }
 
+    [Fact]
+    public void CapturesLoadedWithoutAVerdictAreAnalysedInTheBackground()
+    {
+        var options = new CmdSpyOptions
+        {
+            LogDirectory = _dir.Path,
+            VerifySignatures = false,
+            CorrelateEventLogs = false,
+            CorrelateScheduledTasks = false
+        };
+        using var investigator = new Investigator(new Monitoring.ProcessCache(), options);
+        var done = new System.Collections.Concurrent.ConcurrentDictionary<Guid, Investigation>();
+        investigator.Completed += (ev, inv) => done[ev.Id] = inv;
+        investigator.Start();
+
+        var t = DateTimeOffset.UtcNow.AddHours(-3);
+        var old = new CmdEvent { ProcessId = 4242, ProcessName = "cmd.exe", CommandLine = "cmd /c whoami", TimestampUtc = t };
+        var live = new CmdEvent { ProcessId = 4343, ProcessName = "powershell.exe", CommandLine = "powershell -enc ZQBjAGgAbwA=", TimestampUtc = DateTimeOffset.UtcNow };
+
+        investigator.EnqueueBacklog(old);
+        investigator.EnqueueBacklog(old);   // not queued twice
+        investigator.Enqueue(live);
+
+        Assert.True(Wait.Until(() => done.ContainsKey(old.Id) && done.ContainsKey(live.Id)), "backlog item was never analysed");
+        Assert.NotNull(done[old.Id].Risk);
+        Assert.Equal(0, investigator.Pending);
+    }
+
     private static string ReadShared(string path)
     {
         if (!File.Exists(path)) return "";

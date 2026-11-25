@@ -154,6 +154,9 @@ internal static class Smoke
             ?? throw new InvalidOperationException("This build has no direct COM task registration entry point.");
         var mode = forceCompatibility ? "schtasks fallback after COM failure" : "COM";
         Log($"Testing logon task registration through {mode}.");
+        var installedCheck = startupManager.GetProperty("IsLogonTaskInstalled", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+        bool AppSeesTask() => installedCheck is not null && (bool)installedCheck.GetValue(null)!;
+        Check("App reports the logon task as not set up yet", !AppSeesTask(), "registry check");
         try
         {
             Action<string, string> comRegistration = (definitionXml, identityName) =>
@@ -174,6 +177,7 @@ internal static class Smoke
             var usedCompatibility = (bool)register.Invoke(null, new object?[] { xml, user, comRegistration })!;
             Check($"Logon task registers through {mode}", usedCompatibility == forceCompatibility,
                 usedCompatibility ? "schtasks compatibility path" : "direct COM path");
+            Check("App sees the logon task as set up (no schtasks.exe launch)", AppSeesTask(), "registry check");
             var registered = Schtasks($"/Query /TN \"{taskName}\" /XML").Output;
             var task = XDocument.Parse(registered);
             XNamespace ns = "http://schemas.microsoft.com/windows/2004/02/mit/task";
@@ -225,6 +229,7 @@ internal static class Smoke
             Schtasks($"/End /TN \"{taskName}\"");
             var delete = Schtasks($"/Delete /TN \"{taskName}\" /F");
             Check("Logon task removed again", delete.Code == 0, delete.Output.Trim());
+            Check("App sees the logon task as removed", !AppSeesTask(), "registry check");
         }
     }
 

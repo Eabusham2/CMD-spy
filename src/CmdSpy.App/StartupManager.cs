@@ -32,18 +32,32 @@ internal static class StartupManager
     private static string TaskFile =>
         Path.Combine(Environment.SystemDirectory, "Tasks", TaskFolderName, TaskRegistrationName);
 
+    /// <summary>
+    /// Whether the logon task is registered — read from Task Scheduler's
+    /// registry index (no schtasks.exe launch, whose console host CMD-spy would
+    /// otherwise capture every time a menu opens).
+    /// </summary>
     public static bool IsLogonTaskInstalled
     {
         get
         {
             try
             {
-                if (File.Exists(TaskFile)) return true;
+                var tree = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree" + StartupTaskDefinition.TaskName;
+                using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(tree);
+                if (key is not null) return true;
             }
             catch
             {
             }
-            return Schtasks($"/Query /TN \"{StartupTaskDefinition.TaskName}\"").ExitCode == 0;
+            try
+            {
+                return File.Exists(TaskFile);
+            }
+            catch
+            {
+                return false;
+            }
         }
     }
 

@@ -29,7 +29,7 @@ internal static class Program
         var outDir = args.Length > 0 ? args[0] : "shots";
         var label = args.Length > 1 ? args[1] : "shot";
         int width = args.Length > 2 ? int.Parse(args[2]) : 1500;
-        int height = args.Length > 3 ? int.Parse(args[3]) : 880;
+        int height = args.Length > 3 ? int.Parse(args[3]) : 1040;
         Directory.CreateDirectory(outDir);
 
         Application.SetHighDpiMode(HighDpiMode.SystemAware);
@@ -53,6 +53,7 @@ internal sealed class Director
     private readonly List<Process> _demo = new();
     private Form _form = null!;
     private int _exitCode = 1;
+    private readonly DateTimeOffset _startedUtc = DateTimeOffset.UtcNow;
 
     public Director(string outDir, string label, int width, int height)
     {
@@ -106,10 +107,18 @@ internal sealed class Director
 
             if (investigates)
             {
-                // 2. A popup the analysis rates High risk (row turns red).
+                // 1b. Same popup, details scrolled to the new analysis.
+                ScrollDetailsTo("-- Investigation");
+                await Task.Delay(600);
+                Save(CaptureWindow(_form), "main-investigation");
+
+                // 2. A popup the analysis rates High risk (row turns red), scrolled to why.
                 Select(e => e.CommandLine?.Contains("vssadmin", StringComparison.OrdinalIgnoreCase) == true);
-                await Task.Delay(1000);
+                await Task.Delay(800);
+                ScrollDetailsTo("-- Suspicious indicators");
+                await Task.Delay(600);
                 Save(CaptureWindow(_form), "main-high-risk");
+                SaveReport("high-risk");
 
                 // 3. The new menus, opened over the window.
                 Select(e => e.CommandLine?.Contains("gwmi", StringComparison.OrdinalIgnoreCase) == true);
@@ -177,8 +186,10 @@ internal sealed class Director
 
     private static readonly string[] DemoMarkers = { "CMD-spy demo popup", "gwmi win32_process", "-EncodedCommand", "vssadmin" };
 
+    // Only this run's popups — the window also lists earlier ones from today's log.
     private List<CmdEvent> DemoEvents() => AllEvents()
-        .Where(e => !e.ProcessName.StartsWith("conhost", StringComparison.OrdinalIgnoreCase) &&
+        .Where(e => e.TimestampUtc >= _startedUtc - TimeSpan.FromSeconds(5) &&
+                    !e.ProcessName.StartsWith("conhost", StringComparison.OrdinalIgnoreCase) &&
                     DemoMarkers.Any(m => e.CommandLine?.Contains(m, StringComparison.OrdinalIgnoreCase) == true))
         .GroupBy(e => DemoMarkers.First(m => e.CommandLine!.Contains(m, StringComparison.OrdinalIgnoreCase)))
         .Select(g => g.First())
@@ -195,19 +206,33 @@ internal sealed class Director
     {
         var grid = (DataGridView)Field("_grid")!;
         var view = (IList)Field("_view")!;
-        for (int i = 0; i < view.Count; i++)
+        for (int i = view.Count - 1; i >= 0; i--)   // newest match: this run's popup
         {
-            if (view[i] is CmdEvent e && match(e) && i < grid.Rows.Count)
+            if (view[i] is CmdEvent e && match(e) && i < grid.Rows.Count && e.TimestampUtc >= _startedUtc - TimeSpan.FromSeconds(5))
             {
                 grid.ClearSelection();
                 grid.CurrentCell = grid.Rows[i].Cells[0];
                 grid.Rows[i].Selected = true;
                 grid.FirstDisplayedScrollingRowIndex = Math.Max(0, i - 2);
+                // What a click does: show the popup's report in the details pane.
+                _form.GetType().GetMethod("ShowSelectedDetails", AnyMember)?.Invoke(_form, null);
                 Log($"Selected row {i}: {e.ProcessName} {e.CommandLineShort}");
                 return;
             }
         }
         Log("No row matched the selection.");
+    }
+
+    private void ScrollDetailsTo(string marker)
+    {
+        var details = (TextBox)Field("_details")!;
+        int at = details.Text.IndexOf(marker, StringComparison.Ordinal);
+        if (at < 0) { Log($"'{marker}' not in the details pane."); return; }
+        details.SelectionStart = details.Text.Length;   // scroll past, then back, so the marker lands at the top
+        details.ScrollToCaret();
+        details.SelectionStart = at;
+        details.SelectionLength = 0;
+        details.ScrollToCaret();
     }
 
     // ------------------------------------------------------------- captures --

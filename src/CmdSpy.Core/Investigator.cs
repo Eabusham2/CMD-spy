@@ -26,6 +26,7 @@ public sealed class Investigator : IDisposable
     private readonly WindowsEventHistory _history;
     private readonly ScheduledTaskCorrelator _tasks;
     private readonly ConcurrentDictionary<Guid, byte> _queued = new();
+    private readonly ConcurrentQueue<CmdEvent> _backlog = new();
     private BlockingCollection<CmdEvent>? _queue;
     private Thread? _worker;
     private CancellationTokenSource? _cancel;
@@ -53,7 +54,7 @@ public sealed class Investigator : IDisposable
     /// <summary>Raised on the investigator thread when an analysis finishes.</summary>
     public event Action<CmdEvent, Investigation>? Completed;
 
-    public int Pending => _queue?.Count ?? 0;
+    public int Pending => (_queue?.Count ?? 0) + _backlog.Count;
     public bool IsRunning => _worker is not null;
 
     /// <summary>True while another analysis pass for this event is waiting in the queue.</summary>
@@ -97,6 +98,17 @@ public sealed class Investigator : IDisposable
         }
     }
 
+    /// <summary>
+    /// Queues an older capture (e.g. loaded from today's log without a finished
+    /// analysis) to be analysed when no live capture is waiting.
+    /// </summary>
+    public void EnqueueBacklog(CmdEvent ev)
+    {
+        if (!_options.InvestigateEvents || _queue is null || _queue.IsAddingCompleted) return;
+        if (!_queued.TryAdd(ev.Id, 0)) return;
+        _backlog.Enqueue(ev);
+    }
+
     /// <summary>Stops accepting work and lets queued analyses finish for up to <paramref name="drainTimeout"/>.</summary>
     public void Stop(TimeSpan? drainTimeout = null)
     {
@@ -110,13 +122,14 @@ public sealed class Investigator : IDisposable
         _queue = null;
         _cancel = null;
         _queued.Clear();
+        _backlog.Clear();
     }
 
     public void Dispose() => Stop(TimeSpan.FromSeconds(1));
 
     private void Run(BlockingCollection<CmdEvent> queue, CancellationToken token)
     {
-        foreach (var ev in queue.GetConsumingEnumerable())
+        foreach (var ev in Next(queue, token))
         {
             if (token.IsCancellationRequested) break;
             // Removed before analysing, so a change during analysis queues a fresh pass.
@@ -139,6 +152,33 @@ public sealed class Investigator : IDisposable
             {
                 // A faulty subscriber must not stop the investigator.
             }
+        }
+    }
+
+    /// <summary>Live captures first; the backlog only while nothing live is waiting (and not once stopping).</summary>
+    private IEnumerable<CmdEvent> Next(BlockingCollection<CmdEvent> queue, CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            CmdEvent? ev;
+            try
+            {
+                bool idleWait = _backlog.IsEmpty || queue.IsAddingCompleted;
+                if (!queue.TryTake(out ev, idleWait ? 250 : 0))
+                {
+                    if (queue.IsAddingCompleted)
+                    {
+                        if (queue.IsCompleted) yield break;
+                        continue;
+                    }
+                    if (!_backlog.TryDequeue(out ev)) continue;
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+                yield break;
+            }
+            yield return ev;
         }
     }
 

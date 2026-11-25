@@ -53,9 +53,11 @@ jobs:
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
           }
 
+      # Each run starts from an empty log, so both show the same popups.
       - name: Screenshot (before)
         shell: pwsh
         run: |
+          Remove-Item "$env:ProgramData\CmdSpy\logs" -Recurse -Force -ErrorAction SilentlyContinue
           $p = Start-Process bin-before/GuiScreenshot.exe -ArgumentList 'shots', 'before' -Wait -PassThru
           Get-Content shots/before-harness.log
           "exit code $($p.ExitCode)"
@@ -63,6 +65,7 @@ jobs:
       - name: Screenshot (after)
         shell: pwsh
         run: |
+          Remove-Item "$env:ProgramData\CmdSpy\logs" -Recurse -Force -ErrorAction SilentlyContinue
           $p = Start-Process bin-after/GuiScreenshot.exe -ArgumentList 'shots', 'after' -Wait -PassThru
           Get-Content shots/after-harness.log
           "exit code $($p.ExitCode)"
