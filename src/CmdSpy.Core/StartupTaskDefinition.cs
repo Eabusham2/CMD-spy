@@ -71,7 +71,7 @@ public static class StartupTaskDefinition
             E("Actions", new XAttribute("Context", "Author"),
                 E("Exec", E("Command", executablePath), E("Arguments", Arguments))));
 
-        // schtasks /XML expects UTF-16; the caller writes the file with Encoding.Unicode.
+        // Task Scheduler consumes the in-memory XML as a UTF-16 COM string.
         return "<?xml version=\"1.0\" encoding=\"UTF-16\"?>" + Environment.NewLine + task;
     }
 }

@@ -2,8 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Security.Principal;
-using System.Text;
 using System.Threading;
 using CmdSpy.Core;
 
@@ -21,8 +21,16 @@ namespace CmdSpy.App;
 /// </summary>
 internal static class StartupManager
 {
+    private const string TaskFolderName = "CmdSpy";
+    private const string TaskRegistrationName = "CmdSpy at logon";
+    private const int TaskCreateOrUpdate = 6;
+    private const int TaskLogonInteractiveToken = 3;
+    private const int HResultFileNotFound = unchecked((int)0x80070002);
+    private const int HResultPathNotFound = unchecked((int)0x80070003);
+    private static readonly Guid TaskSchedulerClassId = new("0F87369F-A4E5-4CFC-BD3E-73E6154572DD");
+
     private static string TaskFile =>
-        Path.Combine(Environment.SystemDirectory, "Tasks", "CmdSpy", "CmdSpy at logon");
+        Path.Combine(Environment.SystemDirectory, "Tasks", TaskFolderName, TaskRegistrationName);
 
     public static bool IsLogonTaskInstalled
     {
@@ -53,21 +61,80 @@ internal static class StartupManager
         using (var identity = WindowsIdentity.GetCurrent())
             user = identity.Name;
 
-        var xmlPath = Path.Combine(Path.GetTempPath(), $"cmdspy-logon-task-{Guid.NewGuid():N}.xml");
         try
         {
-            File.WriteAllText(xmlPath, StartupTaskDefinition.BuildXml(exe, user), Encoding.Unicode);
-            var (code, output) = Schtasks($"/Create /TN \"{StartupTaskDefinition.TaskName}\" /XML \"{xmlPath}\" /F");
-            if (code != 0) throw new InvalidOperationException($"Creating the logon task failed: {output.Trim()}");
+            RegisterTask(StartupTaskDefinition.BuildXml(exe, user), user);
         }
-        finally
+        catch (Exception ex)
         {
-            try { File.Delete(xmlPath); } catch { }
+            throw new InvalidOperationException($"Creating the logon task failed: {ex.Message}", ex);
         }
 
         log.Add("✓ CMD-spy opens in the notification area as soon as you log in — elevated, at high priority, with no delay.");
         log.Add("✓ If it is closed or crashes, it comes back when you unlock or reconnect (never more than one copy).");
         return log;
+    }
+
+    /// <summary>
+    /// Registers the definition directly with the Task Scheduler service. Keeping
+    /// the XML in memory prevents another process from replacing it between
+    /// generation and the privileged service consuming it.
+    /// </summary>
+    private static void RegisterTask(string taskXml, string user)
+    {
+        object? service = null;
+        object? rootFolder = null;
+        object? taskFolder = null;
+        object? registeredTask = null;
+
+        try
+        {
+            var serviceType = Type.GetTypeFromCLSID(TaskSchedulerClassId)
+                ?? throw new InvalidOperationException("Windows Task Scheduler is unavailable.");
+            service = Activator.CreateInstance(serviceType)
+                ?? throw new InvalidOperationException("Windows Task Scheduler could not be started.");
+
+            dynamic scheduler = service;
+            scheduler.Connect();
+            rootFolder = scheduler.GetFolder(@"\");
+            taskFolder = GetOrCreateTaskFolder(rootFolder);
+
+            dynamic folder = taskFolder;
+            registeredTask = folder.RegisterTask(
+                TaskRegistrationName,
+                taskXml,
+                TaskCreateOrUpdate,
+                user,
+                null,
+                TaskLogonInteractiveToken,
+                null);
+        }
+        finally
+        {
+            ReleaseComObject(registeredTask);
+            ReleaseComObject(taskFolder);
+            ReleaseComObject(rootFolder);
+            ReleaseComObject(service);
+        }
+    }
+
+    private static object GetOrCreateTaskFolder(object rootFolder)
+    {
+        dynamic root = rootFolder;
+        try
+        {
+            return root.GetFolder(TaskFolderName);
+        }
+        catch (COMException ex) when (ex.HResult == HResultFileNotFound || ex.HResult == HResultPathNotFound)
+        {
+            return root.CreateFolder(TaskFolderName, null);
+        }
+    }
+
+    private static void ReleaseComObject(object? value)
+    {
+        if (value is not null && Marshal.IsComObject(value))
+            Marshal.FinalReleaseComObject(value);
     }
 
     public static List<string> DisableLogonTask()
