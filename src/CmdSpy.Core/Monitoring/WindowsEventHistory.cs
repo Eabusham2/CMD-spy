@@ -457,6 +457,8 @@ public sealed class WindowsEventHistory
 /// <summary>Turns on the Windows logging that makes launch history traceable.</summary>
 public static class WindowsLoggingSetup
 {
+    private const string AuditPolicyExecutable = "auditpol.exe";
+
     /// <summary>The "Process Creation" audit subcategory (locale-independent GUID).</summary>
     public const string ProcessCreationAuditGuid = "{0CCE922B-69AE-11D9-BED3-505054503030}";
 
@@ -480,9 +482,10 @@ public static class WindowsLoggingSetup
 
         try
         {
+            var auditPolicyPath = GetTrustedAuditPolicyPath();
             using var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
             {
-                FileName = "auditpol.exe",
+                FileName = auditPolicyPath,
                 Arguments = $"/set /subcategory:{ProcessCreationAuditGuid} /success:enable",
                 UseShellExecute = false,
                 CreateNoWindow = true,
@@ -514,6 +517,22 @@ public static class WindowsLoggingSetup
             results.Add($"✗ Could not enable Task Scheduler history: {ex.Message}");
         }
         return results;
+    }
+
+    private static string GetTrustedAuditPolicyPath()
+    {
+        var systemDirectory = Path.TrimEndingDirectorySeparator(Path.GetFullPath(Environment.SystemDirectory));
+        var executablePath = Path.GetFullPath(Path.Combine(systemDirectory, AuditPolicyExecutable));
+
+        if (!Path.IsPathFullyQualified(executablePath) ||
+            !string.Equals(Path.GetDirectoryName(executablePath), systemDirectory, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("The Windows audit policy utility is outside the system directory.");
+
+        if ((File.GetAttributes(systemDirectory) & FileAttributes.ReparsePoint) != 0 ||
+            (File.GetAttributes(executablePath) & FileAttributes.ReparsePoint) != 0)
+            throw new InvalidOperationException("The Windows audit policy utility resolves through a reparse point.");
+
+        return executablePath;
     }
 
     private static string SetDword(string subKey, string name, string description)
