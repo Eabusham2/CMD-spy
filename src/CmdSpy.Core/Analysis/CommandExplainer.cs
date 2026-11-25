@@ -824,52 +824,74 @@ public static class CommandExplainer
         ["Get-CimClass"] = new("lists WMI classes", Effects.SystemDiscovery, true),
     };
 
+    private static readonly HashSet<string> DataCmdlets = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Where-Object", "Select-Object", "ForEach-Object", "Sort-Object", "Group-Object", "Measure-Object",
+        "Format-Table", "Format-List", "Format-Wide", "Write-Output", "Write-Host", "Out-String", "Out-Null"
+    };
+
     private static List<Step> DescribePowerShellScript(string text, Context ctx)
     {
+        // Keep the original human-readable explanations. The AST is a second,
+        // conservative check for behavior the statement-level reference missed.
+        var steps = StatementSplitter.SplitPowerShell(text)
+            .Select(statement => DescribePowerShellStatement(statement, ctx)).ToList();
         var script = Parser.ParseInput(text, out _, out var parseErrors);
 
-        // FindAll(..., true) descends into every nested ScriptBlockAst. Describing
-        // each PipelineAst separately prevents an outer data cmdlet from hiding a
-        // later command in its script block.
-        var statements = script.FindAll(node => node is StatementAst, searchNestedScriptBlocks: true)
-            .OfType<StatementAst>()
-            .ToList();
-        var steps = statements
-            .OfType<PipelineAst>()
-            .OrderBy(pipeline => pipeline.Extent.StartOffset)
-            .ThenByDescending(pipeline => pipeline.Extent.EndOffset - pipeline.Extent.StartOffset)
-            .Select(pipeline => DescribePowerShellStatement(pipeline.Extent.Text, ctx))
-            .ToList();
-
-        if (steps.Count == 0 && parseErrors.Length == 0 && text.TrimStart().StartsWith("#", StringComparison.Ordinal))
-            steps.Add(new Step("Comment.", null, true));
+        void AddEvidence(Step evidence)
+        {
+            // Read-only AST components do not replace or duplicate the legacy
+            // explanation. Never let an existing read-only description conceal
+            // an additional modifying or unresolved operation.
+            if (evidence.ReadOnly == true) return;
+            if (steps.Any(step => step.ReadOnly == evidence.ReadOnly &&
+                                  evidence.Effects.All(step.Effects.Contains) &&
+                                  step.Detail.Contains(evidence.Detail.TrimEnd('.'), StringComparison.Ordinal))) return;
+            steps.Add(evidence);
+        }
 
         if (parseErrors.Length > 0)
         {
-            steps.Add(new Step(
+            AddEvidence(new Step(
                 $"PowerShell could not fully parse this command near: {Shorten(parseErrors[0].Extent.Text, 80)}.",
                 "contains PowerShell syntax that could not be parsed", null, Effects.Unknown));
         }
 
+        var functions = script.FindAll(node => node is FunctionDefinitionAst && IsExecutedPowerShellAst(node), true)
+            .Cast<FunctionDefinitionAst>()
+            .Select(function => function.Name[(function.Name.LastIndexOf(':') + 1)..])
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var commands = script.FindAll(node => node is CommandAst, searchNestedScriptBlocks: true)
-            .OfType<CommandAst>();
+            .OfType<CommandAst>().Where(IsExecutedPowerShellAst);
         foreach (var command in commands)
         {
             var commandName = command.GetCommandName();
             if (commandName is null)
             {
-                steps.Add(new Step(
+                AddEvidence(new Step(
                     $"Runs a dynamically resolved PowerShell command: {Shorten(command.Extent.Text, 120)}. Its effect is unknown.",
                     "runs a dynamically resolved command", null, Effects.Unknown));
                 continue;
             }
 
+            if (functions.Contains(commandName))
+            {
+                AddEvidence(new Step($"Calls the locally defined function {commandName}; its execution cannot be inferred from the command name.",
+                    "calls a locally defined function", null, Effects.Unknown));
+            }
+
             if (UsesUnresolvedScriptBlock(command, commandName))
             {
-                steps.Add(new Step(
+                AddEvidence(new Step(
                     $"{commandName} receives executable behavior that is not visible as a literal script block: {Shorten(command.Extent.Text, 120)}.",
                     "uses a dynamically supplied script block", null, Effects.Unknown));
             }
+
+            var canonical = PsAliases.TryGetValue(commandName, out var alias) ? alias : commandName;
+            // Their original descriptions are already present, and the walk
+            // checks each executed callback separately below.
+            if (canonical.Equals("ForEach-Object", StringComparison.OrdinalIgnoreCase) ||
+                canonical.Equals("Where-Object", StringComparison.OrdinalIgnoreCase)) continue;
 
             // Normalize call-operator forms such as & 'Set-Content' so the
             // classifier uses the AST-resolved command name, not quote syntax.
@@ -881,33 +903,47 @@ public static class CommandExplainer
                 ? command.Extent.Text[argumentOffset..]
                 : "";
             var inPipeline = command.Parent is PipelineAst pipeline && pipeline.PipelineElements.Count > 1;
-            steps.Add(DescribePowerShellElement(commandName + arguments, ctx, inPipeline));
+            AddEvidence(DescribePowerShellElement(commandName + arguments, ctx, inPipeline));
+        }
+
+        var opaqueBlocks = script.FindAll(node => node is ScriptBlockExpressionAst, true)
+            .OfType<ScriptBlockExpressionAst>()
+            .Where(block => IsExecutedPowerShellAst(block) && GetScriptBlockUsage(block) == ScriptBlockUsage.Unknown);
+        foreach (var block in opaqueBlocks)
+        {
+            AddEvidence(new Step(
+                $"Passes a script block to a command whose callback behavior is unknown: {Shorten(block.Extent.Text, 120)}.",
+                "passes code to a command with unknown callback behavior", null, Effects.Unknown));
         }
 
         var memberCalls = script.FindAll(node => node is InvokeMemberExpressionAst, searchNestedScriptBlocks: true)
-            .OfType<InvokeMemberExpressionAst>();
+            .OfType<InvokeMemberExpressionAst>().Where(IsExecutedPowerShellAst);
         foreach (var call in memberCalls)
         {
-            steps.Add(DescribeExpression(call.Extent.Text) ?? new Step(
+            AddEvidence(DescribeExpression(call.Extent.Text) ?? new Step(
                 $"Calls a .NET method whose effect is unknown: {Shorten(call.Extent.Text, 120)}.",
                 "calls a .NET method with an unknown effect", null, Effects.Unknown));
         }
 
-        var propertyAssignments = statements
+        var propertyAssignments = script.FindAll(node => node is AssignmentStatementAst, true)
             .OfType<AssignmentStatementAst>()
-            .Where(assignment => assignment.Left is not VariableExpressionAst);
+            .Where(assignment => assignment.Left is not VariableExpressionAst && IsExecutedPowerShellAst(assignment));
         foreach (var assignment in propertyAssignments)
         {
-            steps.Add(new Step(
+            AddEvidence(new Step(
                 $"Assigns through a property or expression whose effect is unknown: {Shorten(assignment.Extent.Text, 120)}.",
                 "assigns through an expression with an unknown effect", null, Effects.Unknown));
         }
 
         var fileRedirections = script.FindAll(node => node is FileRedirectionAst, searchNestedScriptBlocks: true)
-            .OfType<FileRedirectionAst>();
+            .OfType<FileRedirectionAst>().Where(IsExecutedPowerShellAst);
         foreach (var redirection in fileRedirections)
         {
-            steps.Add(new Step(
+            // $null discards output; it is not a path. Other expressions may
+            // resolve to files and remain conservatively classified as writes.
+            if (redirection.Location is VariableExpressionAst target &&
+                target.VariablePath.UserPath.Equals("null", StringComparison.OrdinalIgnoreCase)) continue;
+            AddEvidence(new Step(
                 $"Redirects PowerShell output to a file: {Shorten(redirection.Extent.Text, 100)}.",
                 "writes redirected output to a file", false, Effects.WritesFiles));
         }
@@ -922,30 +958,98 @@ public static class CommandExplainer
         return steps;
     }
 
+    private static bool IsExecutedPowerShellAst(Ast node)
+    {
+        for (var parent = node.Parent; parent is not null; parent = parent.Parent)
+        {
+            if (parent is FunctionDefinitionAst) return false;
+            if (parent is ScriptBlockExpressionAst block && !IsInvokedScriptBlock(block)) return false;
+        }
+        return true;
+    }
+
+    private enum ScriptBlockUsage { Data, Invoked, Unknown }
+
+    private static bool IsInvokedScriptBlock(ScriptBlockExpressionAst block) =>
+        GetScriptBlockUsage(block) == ScriptBlockUsage.Invoked;
+
+    private static ScriptBlockUsage GetScriptBlockUsage(ScriptBlockExpressionAst block)
+    {
+        Ast argument = block;
+        while (argument.Parent is not null && argument.Parent is not CommandAst)
+        {
+            if (argument.Parent is InvokeMemberExpressionAst invocation &&
+                ReferenceEquals(invocation.Expression, argument) &&
+                invocation.Member is StringConstantExpressionAst member &&
+                (member.Value.Equals("Invoke", StringComparison.OrdinalIgnoreCase) ||
+                 member.Value.Equals("InvokeReturnAsIs", StringComparison.OrdinalIgnoreCase) ||
+                 member.Value.Equals("InvokeWithContext", StringComparison.OrdinalIgnoreCase))) return ScriptBlockUsage.Invoked;
+            if (argument.Parent is ScriptBlockAst or FunctionDefinitionAst) return ScriptBlockUsage.Data;
+            argument = argument.Parent;
+        }
+        if (argument.Parent is not CommandAst command || argument is not CommandElementAst element) return ScriptBlockUsage.Data;
+        if (ReferenceEquals(command.CommandElements[0], argument))
+            return command.InvocationOperator is TokenKind.Ampersand or TokenKind.Dot
+                ? ScriptBlockUsage.Invoked : ScriptBlockUsage.Data;
+
+        var name = command.GetCommandName() ?? "";
+        var canonical = PsAliases.TryGetValue(name, out var alias) ? alias : name;
+        var parameter = argument is CommandParameterAst attached ? attached.ParameterName : null;
+        var index = command.CommandElements.IndexOf(element);
+        if (parameter is null && index > 0 && command.CommandElements[index - 1] is CommandParameterAst previous &&
+            !IsPowerShellSwitch(previous.ParameterName)) parameter = previous.ParameterName;
+
+        bool? invoked = canonical.ToLowerInvariant() switch
+        {
+            "foreach-object" => parameter is null || IsParameterPrefix(parameter, "Begin", "End", "Process", "Parallel", "RemainingScripts"),
+            "where-object" => parameter is null || IsParameterPrefix(parameter, "FilterScript"),
+            "measure-command" or "trace-command" => parameter is null || IsParameterPrefix(parameter, "Expression"),
+            "invoke-command" or "start-job" or "start-threadjob" => parameter is null || IsParameterPrefix(parameter, "ScriptBlock", "InitializationScript"),
+            "select-object" or "sort-object" or "group-object" or "measure-object" or
+                "format-table" or "format-list" or "format-wide" => parameter is null || IsParameterPrefix(parameter, "Property", "GroupBy"),
+            "write-output" or "write-host" or "out-string" or "out-null" or "out-file" or
+                "convertto-json" or "convertto-csv" or "export-csv" => false,
+            _ => null
+        };
+        return invoked == true ? ScriptBlockUsage.Invoked : invoked == false ? ScriptBlockUsage.Data : ScriptBlockUsage.Unknown;
+    }
+
     private static bool UsesUnresolvedScriptBlock(CommandAst command, string commandName)
     {
         var canonical = PsAliases.TryGetValue(commandName, out var alias) ? alias : commandName;
         var isForEach = canonical.Equals("ForEach-Object", StringComparison.OrdinalIgnoreCase);
         var isWhere = canonical.Equals("Where-Object", StringComparison.OrdinalIgnoreCase);
-        if ((!isForEach && !isWhere) || command.CommandElements.OfType<ScriptBlockExpressionAst>().Any())
-            return false;
+        if (!isForEach && !isWhere) return false;
 
         var elements = command.CommandElements;
-        if (isForEach)
+        for (int i = 1; i < elements.Count; i++)
         {
-            if (elements.Count == 2 && elements[1] is VariableExpressionAst)
+            if (elements[i] is CommandParameterAst parameter)
+            {
+                if (isForEach && IsParameterPrefix(parameter.ParameterName, "MemberName")) return true;
+                if (IsPowerShellSwitch(parameter.ParameterName)) continue;
+                var value = parameter.Argument ?? (i + 1 < elements.Count ? elements[++i] : null);
+                bool executable = isForEach
+                    ? IsParameterPrefix(parameter.ParameterName, "Begin", "End", "Process", "Parallel", "RemainingScripts")
+                    : IsParameterPrefix(parameter.ParameterName, "FilterScript");
+                if (executable && !IsLiteralScriptBlock(value)) return true;
+            }
+            else if (!IsLiteralScriptBlock(elements[i]) &&
+                     (isForEach || elements[i] is not StringConstantExpressionAst))
+            {
+                // ForEach's positional member syntax can invoke methods (e.g.
+                // Kill), while Where's ordinary property-name syntax is a filter.
                 return true;
-
-            return elements.OfType<CommandParameterAst>().Any(parameter =>
-                IsParameterPrefix(parameter.ParameterName, "Begin", "End", "MemberName", "Parallel", "Process"));
+            }
         }
-
-        if (elements.Count == 2 && elements[1] is VariableExpressionAst)
-            return true;
-
-        return elements.OfType<CommandParameterAst>().Any(parameter =>
-            IsParameterPrefix(parameter.ParameterName, "FilterScript"));
+        return false;
     }
+
+    private static bool IsLiteralScriptBlock(Ast? value) => value is ScriptBlockExpressionAst ||
+        value is ArrayLiteralAst array && array.Elements.All(element => element is ScriptBlockExpressionAst);
+
+    private static bool IsPowerShellSwitch(string parameterName) =>
+        IsParameterPrefix(parameterName, "Verbose", "Debug", "WhatIf", "Confirm", "AsJob", "UseNewRunspace");
 
     private static bool IsParameterPrefix(string parameterName, params string[] names) =>
         parameterName.Length > 0 && names.Any(name => name.StartsWith(parameterName, StringComparison.OrdinalIgnoreCase));
@@ -1032,7 +1136,30 @@ public static class CommandExplainer
             }
             case "foreach-object":
             case "where-object":
+            {
+                // Keep the original description of a visible body, but do not
+                // mistake a script block supplied as data (e.g. -InputObject)
+                // for the callback that this command actually invokes.
+                var syntax = Parser.ParseInput(text, out _, out _);
+                var block = syntax.FindAll(node => node is ScriptBlockExpressionAst, true)
+                    .OfType<ScriptBlockExpressionAst>()
+                    .FirstOrDefault(candidate => IsInvokedScriptBlock(candidate) && IsExecutedPowerShellAst(candidate));
+                if (block is not null)
+                {
+                    var blockText = block.Extent.Text;
+                    var body = blockText.Length > 1 && blockText.EndsWith('}')
+                        ? blockText[1..^1].Trim()
+                        : blockText.TrimStart('{').Trim();
+                    var first = PsWords(body).FirstOrDefault() ?? "";
+                    var firstCanonical = PsAliases.TryGetValue(first, out var a2) ? a2 : first;
+                    if (Cmdlets.ContainsKey(firstCanonical) && !DataCmdlets.Contains(firstCanonical))
+                    {
+                        var inner = DescribePowerShellStatement(body, ctx);
+                        return Prefix($"{canonical}{aliasNote} runs for each item: ", inner);
+                    }
+                }
                 return new Step($"{canonical}{aliasNote}: filters/processes data.", null, true, Effects.DataProcessing);
+            }
             case "get-wmiobject":
             case "get-ciminstance":
                 return DescribeWmiQuery(canonical + aliasNote, words, text, ctx);
