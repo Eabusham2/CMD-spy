@@ -85,4 +85,15 @@ public class StartupTests
         using var next = new SingleInstance(name);
         Assert.True(next.IsFirst);
     }
+
+    [WindowsFact]
+    public void SingleInstance_GlobalNameSquattingCannotSuppressStartup()
+    {
+        var name = "CmdSpy.Test." + Guid.NewGuid().ToString("N");
+        using var squatted = new Mutex(initiallyOwned: false, @"Global\" + name, out bool createdNew);
+        Assert.True(createdNew);
+
+        using var instance = new SingleInstance(name);
+        Assert.True(instance.IsFirst);
+    }
 }
