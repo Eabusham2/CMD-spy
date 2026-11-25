@@ -142,6 +142,56 @@ public class AnalysisTests
         Assert.Equal("Could not fully determine", unknown.Classification);
     }
 
+    [Theory]
+    [InlineData(@"powershell -c Get-Process | ForEach-Object { Write-Output $_; Set-Content C:\x y }")]
+    [InlineData(@"powershell -c Get-Process | foreach { where { echo $_; sc C:\x y } }")]
+    [InlineData(@"powershell -c Get-Process | ForEach-Object { Write-Output $_; & 'Set-Content' C:\x y }")]
+    public void Explainer_AnalyzesEveryCommandInPowerShellScriptBlocks(string command)
+    {
+        var explanation = CommandExplainer.Explain(CommandParser.Parse(command));
+
+        Assert.False(explanation.IsReadOnly);
+        Assert.Contains(Effects.WritesFiles, explanation.Effects);
+        Assert.Contains(explanation.Details, detail => detail.Contains("Set-Content", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Explainer_FindsFileRedirectionInPowerShellScriptBlocks()
+    {
+        var explanation = CommandExplainer.Explain(CommandParser.Parse(
+            @"powershell -c Get-Process | ForEach-Object { Write-Output $_ > C:\x }"));
+
+        Assert.False(explanation.IsReadOnly);
+        Assert.Contains(Effects.WritesFiles, explanation.Effects);
+        Assert.Contains(explanation.Details, detail => detail.Contains("redirect", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Explainer_PreservesReadOnlyPowerShellFilters()
+    {
+        var explanation = CommandExplainer.Explain(CommandParser.Parse(
+            @"powershell -c Get-Process | Where-Object { $_.CPU -gt 10 } | Select-Object Name"));
+
+        Assert.True(explanation.IsReadOnly);
+        Assert.Contains(Effects.ProcessDiscovery, explanation.Effects);
+        Assert.Contains(Effects.DataProcessing, explanation.Effects);
+    }
+
+    [Theory]
+    [InlineData(@"powershell -c & $command")]
+    [InlineData(@"powershell -c Get-Process | ForEach-Object $action")]
+    [InlineData(@"powershell -c Get-Process | Where-Object -FilterScript $predicate")]
+    [InlineData(@"powershell -c Get-Process | ForEach-Object { & $command $_ }")]
+    [InlineData(@"powershell -c Get-Process | ForEach-Object { $_.Kill() }")]
+    [InlineData(@"powershell -c Get-Process | Where-Object { $_.Name -eq 'powershell'")]
+    public void Explainer_DynamicOrUnparsedPowerShellIsUnknown(string command)
+    {
+        var explanation = CommandExplainer.Explain(CommandParser.Parse(command));
+
+        Assert.Null(explanation.IsReadOnly);
+        Assert.Contains(Effects.Unknown, explanation.Effects);
+    }
+
     // ------------------------------------------------------------- detector --
 
     private static List<Finding> Detect(string command, IReadOnlyList<ProcessInfo>? ancestry = null, bool selfTest = false)
@@ -266,6 +316,31 @@ public class AnalysisTests
         Assert.Equal(RiskLevel.Low, risk.Level);
         Assert.Contains("not proof that the computer is clean", risk.Summary);
         Assert.NotEmpty(risk.Disclaimer);
+    }
+
+    [Theory]
+    [InlineData(@"powershell -c Get-Process | ForEach-Object { Write-Output $_; Set-Content C:\x y }")]
+    [InlineData(@"powershell -c Get-Process | ForEach-Object { & $command $_ }")]
+    public void Risk_IncompleteOrModifyingPowerShellCannotReceiveLowVerdict(string command)
+    {
+        var launcher = Launcher();
+        var risk = RiskAssessor.Assess(new RiskInput
+        {
+            Findings = Detect(command),
+            Explanation = CommandExplainer.Explain(CommandParser.Parse(command)),
+            ProcessName = "powershell.exe",
+            Ancestry = new[] { launcher },
+            AncestryComplete = true,
+            Launcher = launcher,
+            Signatures = new[]
+            {
+                Signed("this process", "Microsoft Windows"),
+                Signed("parent, launcher", "ASUSTeK COMPUTER INC.")
+            }
+        });
+
+        Assert.Equal(RiskLevel.Unknown, risk.Level);
+        Assert.Contains("command's effect", risk.Summary, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

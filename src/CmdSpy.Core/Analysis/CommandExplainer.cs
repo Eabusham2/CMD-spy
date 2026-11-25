@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Management.Automation.Language;
 using System.Text;
 using System.Text.RegularExpressions;
 using CmdSpy.Core.Models;
@@ -159,8 +160,7 @@ public static class CommandExplainer
                             "opens an interactive window", null, Effects.Unknown));
                     break;
                 }
-                foreach (var statement in StatementSplitter.SplitPowerShell(text))
-                    steps.Add(DescribePowerShellStatement(statement, ctx));
+                steps.AddRange(DescribePowerShellScript(text, ctx));
                 break;
 
             case InterpreterKind.WScript:
@@ -830,6 +830,302 @@ public static class CommandExplainer
         "Format-Table", "Format-List", "Format-Wide", "Write-Output", "Write-Host", "Out-String", "Out-Null"
     };
 
+    private static List<Step> DescribePowerShellScript(string text, Context ctx)
+    {
+        // Keep the original human-readable explanations. The AST is a second,
+        // conservative check for behavior the statement-level reference missed.
+        var steps = StatementSplitter.SplitPowerShell(text)
+            .Select(statement => DescribePowerShellStatement(statement, ctx)).ToList();
+        var script = Parser.ParseInput(text, out _, out var parseErrors);
+
+        void AddEvidence(Step evidence)
+        {
+            // Read-only AST components do not replace or duplicate the legacy
+            // explanation. Never let an existing read-only description conceal
+            // an additional modifying or unresolved operation.
+            if (evidence.ReadOnly == true) return;
+            if (steps.Any(step => step.ReadOnly == evidence.ReadOnly &&
+                                  evidence.Effects.All(step.Effects.Contains) &&
+                                  step.Detail.Contains(evidence.Detail.TrimEnd('.'), StringComparison.Ordinal))) return;
+            steps.Add(evidence);
+        }
+
+        if (parseErrors.Length > 0)
+        {
+            AddEvidence(new Step(
+                $"PowerShell could not fully parse this command near: {Shorten(parseErrors[0].Extent.Text, 80)}.",
+                "contains PowerShell syntax that could not be parsed", null, Effects.Unknown));
+        }
+
+        var functions = script.FindAll(node => node is FunctionDefinitionAst && IsExecutedPowerShellAst(node), true)
+            .Cast<FunctionDefinitionAst>()
+            .Select(function => function.Name[(function.Name.LastIndexOf(':') + 1)..])
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var commands = script.FindAll(node => node is CommandAst, searchNestedScriptBlocks: true)
+            .OfType<CommandAst>().Where(IsExecutedPowerShellAst);
+        foreach (var command in commands)
+        {
+            var commandName = command.GetCommandName();
+            if (commandName is null)
+            {
+                AddEvidence(new Step(
+                    $"Runs a dynamically resolved PowerShell command: {Shorten(command.Extent.Text, 120)}. Its effect is unknown.",
+                    "runs a dynamically resolved command", null, Effects.Unknown));
+                continue;
+            }
+
+            if (functions.Contains(commandName))
+            {
+                AddEvidence(new Step($"Calls the locally defined function {commandName}; its execution cannot be inferred from the command name.",
+                    "calls a locally defined function", null, Effects.Unknown));
+            }
+
+            if (UsesUnresolvedScriptBlock(command, commandName))
+            {
+                AddEvidence(new Step(
+                    $"{commandName} receives executable behavior that is not visible as a literal script block: {Shorten(command.Extent.Text, 120)}.",
+                    "uses a dynamically supplied script block", null, Effects.Unknown));
+            }
+
+            if (UsesUnresolvedCalculatedProperty(command, commandName))
+            {
+                AddEvidence(new Step(
+                    $"{commandName} receives a property or grouping definition whose callback behavior is unknown: {Shorten(command.Extent.Text, 120)}.",
+                    "uses an unresolved property or grouping callback", null, Effects.Unknown));
+            }
+
+            var canonical = PsAliases.TryGetValue(commandName, out var alias) ? alias : commandName;
+            // Their original descriptions are already present, and the walk
+            // checks each executed callback separately below.
+            if (canonical.Equals("ForEach-Object", StringComparison.OrdinalIgnoreCase) ||
+                canonical.Equals("Where-Object", StringComparison.OrdinalIgnoreCase)) continue;
+
+            // Normalize call-operator forms such as & 'Set-Content' so the
+            // classifier uses the AST-resolved command name, not quote syntax.
+            var firstElement = command.CommandElements.FirstOrDefault();
+            var argumentOffset = firstElement is null
+                ? command.Extent.Text.Length
+                : firstElement.Extent.EndOffset - command.Extent.StartOffset;
+            var arguments = argumentOffset >= 0 && argumentOffset <= command.Extent.Text.Length
+                ? command.Extent.Text[argumentOffset..]
+                : "";
+            var inPipeline = command.Parent is PipelineAst pipeline && pipeline.PipelineElements.Count > 1;
+            AddEvidence(DescribePowerShellElement(commandName + arguments, ctx, inPipeline));
+        }
+
+        var opaqueBlocks = script.FindAll(node => node is ScriptBlockExpressionAst, true)
+            .OfType<ScriptBlockExpressionAst>()
+            .Where(block => IsExecutedPowerShellAst(block) && GetScriptBlockUsage(block) == ScriptBlockUsage.Unknown);
+        foreach (var block in opaqueBlocks)
+        {
+            AddEvidence(new Step(
+                $"Passes a script block to a command whose callback behavior is unknown: {Shorten(block.Extent.Text, 120)}.",
+                "passes code to a command with unknown callback behavior", null, Effects.Unknown));
+        }
+
+        var memberCalls = script.FindAll(node => node is InvokeMemberExpressionAst, searchNestedScriptBlocks: true)
+            .OfType<InvokeMemberExpressionAst>().Where(IsExecutedPowerShellAst);
+        foreach (var call in memberCalls)
+        {
+            AddEvidence(DescribeExpression(call.Extent.Text) ?? new Step(
+                $"Calls a .NET method whose effect is unknown: {Shorten(call.Extent.Text, 120)}.",
+                "calls a .NET method with an unknown effect", null, Effects.Unknown));
+        }
+
+        var propertyAssignments = script.FindAll(node => node is AssignmentStatementAst, true)
+            .OfType<AssignmentStatementAst>()
+            .Where(assignment => assignment.Left is not VariableExpressionAst && IsExecutedPowerShellAst(assignment));
+        foreach (var assignment in propertyAssignments)
+        {
+            AddEvidence(new Step(
+                $"Assigns through a property or expression whose effect is unknown: {Shorten(assignment.Extent.Text, 120)}.",
+                "assigns through an expression with an unknown effect", null, Effects.Unknown));
+        }
+
+        var fileRedirections = script.FindAll(node => node is FileRedirectionAst, searchNestedScriptBlocks: true)
+            .OfType<FileRedirectionAst>().Where(IsExecutedPowerShellAst);
+        foreach (var redirection in fileRedirections)
+        {
+            // $null discards output; it is not a path. Other expressions may
+            // resolve to files and remain conservatively classified as writes.
+            if (redirection.Location is VariableExpressionAst target &&
+                target.VariablePath.UserPath.Equals("null", StringComparison.OrdinalIgnoreCase)) continue;
+            AddEvidence(new Step(
+                $"Redirects PowerShell output to a file: {Shorten(redirection.Extent.Text, 100)}.",
+                "writes redirected output to a file", false, Effects.WritesFiles));
+        }
+
+        if (steps.Count == 0)
+        {
+            steps.Add(new Step(
+                $"PowerShell syntax was parsed but its effect could not be classified: {Shorten(text, 120)}.",
+                "contains PowerShell syntax with an unknown effect", null, Effects.Unknown));
+        }
+
+        return steps;
+    }
+
+    private static bool IsExecutedPowerShellAst(Ast node)
+    {
+        for (var parent = node.Parent; parent is not null; parent = parent.Parent)
+        {
+            if (parent is FunctionDefinitionAst) return false;
+            if (parent is ScriptBlockExpressionAst block && !IsInvokedScriptBlock(block)) return false;
+        }
+        return true;
+    }
+
+    private enum ScriptBlockUsage { Data, Invoked, Unknown }
+
+    private static bool IsInvokedScriptBlock(ScriptBlockExpressionAst block) =>
+        GetScriptBlockUsage(block) == ScriptBlockUsage.Invoked;
+
+    private static ScriptBlockUsage GetScriptBlockUsage(ScriptBlockExpressionAst block)
+    {
+        Ast argument = block;
+        while (argument.Parent is not null && argument.Parent is not CommandAst)
+        {
+            if (argument.Parent is InvokeMemberExpressionAst invocation &&
+                ReferenceEquals(invocation.Expression, argument) &&
+                invocation.Member is StringConstantExpressionAst member &&
+                (member.Value.Equals("Invoke", StringComparison.OrdinalIgnoreCase) ||
+                 member.Value.Equals("InvokeReturnAsIs", StringComparison.OrdinalIgnoreCase) ||
+                 member.Value.Equals("InvokeWithContext", StringComparison.OrdinalIgnoreCase))) return ScriptBlockUsage.Invoked;
+            if (argument.Parent is ScriptBlockAst or FunctionDefinitionAst) return ScriptBlockUsage.Data;
+            argument = argument.Parent;
+        }
+        if (argument.Parent is not CommandAst command || argument is not CommandElementAst element) return ScriptBlockUsage.Data;
+        if (ReferenceEquals(command.CommandElements[0], argument))
+            return command.InvocationOperator is TokenKind.Ampersand or TokenKind.Dot
+                ? ScriptBlockUsage.Invoked : ScriptBlockUsage.Data;
+
+        var name = command.GetCommandName() ?? "";
+        var canonical = PsAliases.TryGetValue(name, out var alias) ? alias : name;
+        var parameter = argument is CommandParameterAst attached ? attached.ParameterName : null;
+        var index = command.CommandElements.IndexOf(element);
+        if (parameter is null && index > 0 && command.CommandElements[index - 1] is CommandParameterAst previous &&
+            previous.Argument is null && !IsPowerShellSwitch(previous.ParameterName) &&
+            !IsCalculatedPropertySwitch(previous.ParameterName, canonical)) parameter = previous.ParameterName;
+
+        bool? invoked = canonical.ToLowerInvariant() switch
+        {
+            "foreach-object" => parameter is null || IsParameterPrefix(parameter, "Begin", "End", "Process", "Parallel", "RemainingScripts"),
+            "where-object" => parameter is null || IsParameterPrefix(parameter, "FilterScript"),
+            "measure-command" or "trace-command" => parameter is null || IsParameterPrefix(parameter, "Expression"),
+            "invoke-command" or "start-job" or "start-threadjob" => parameter is null || IsParameterPrefix(parameter, "ScriptBlock", "InitializationScript"),
+            "select-object" or "sort-object" or "group-object" or "measure-object" or
+                "format-table" or "format-list" or "format-wide" => parameter is null || IsParameterPrefix(parameter, "Property", "GroupBy"),
+            "write-output" or "write-host" or "out-string" or "out-null" or "out-file" or
+                "convertto-json" or "convertto-csv" or "export-csv" => false,
+            _ => null
+        };
+        return invoked == true ? ScriptBlockUsage.Invoked : invoked == false ? ScriptBlockUsage.Data : ScriptBlockUsage.Unknown;
+    }
+
+    private static bool IsCalculatedPropertyConsumer(string canonical) =>
+        canonical.ToLowerInvariant() is "select-object" or "sort-object" or "group-object" or
+            "measure-object" or "format-table" or "format-list" or "format-wide";
+
+    // Keep argument scanning and script-block usage classification in agreement:
+    // a positional property after a switch is still an executable callback.
+    private static bool IsCalculatedPropertySwitch(string parameterName, string canonical) =>
+        IsCalculatedPropertyConsumer(canonical) &&
+        IsParameterPrefix(parameterName,
+            "Unique", "Wait", "Descending", "Stable", "CaseSensitive",
+            "NoElement", "AsHashTable", "AsString", "Sum", "Average", "Maximum",
+            "Minimum", "StandardDeviation", "AllStats", "Line", "Word", "Character",
+            "IgnoreWhiteSpace", "AutoSize", "Wrap", "HideTableHeaders", "Force",
+            "ShowError", "DisplayError", "RepeatHeader");
+
+    private static bool UsesUnresolvedCalculatedProperty(CommandAst command, string commandName)
+    {
+        var canonical = PsAliases.TryGetValue(commandName, out var alias) ? alias : commandName;
+        if (!IsCalculatedPropertyConsumer(canonical)) return false;
+
+        var elements = command.CommandElements;
+        for (int i = 1; i < elements.Count; i++)
+        {
+            if (elements[i] is CommandParameterAst parameter)
+            {
+                bool callback = IsParameterPrefix(parameter.ParameterName, "Property", "GroupBy");
+                if (!callback && (IsPowerShellSwitch(parameter.ParameterName) ||
+                    IsCalculatedPropertySwitch(parameter.ParameterName, canonical))) continue;
+
+                Ast? value = parameter.Argument;
+                if (value is null && i + 1 < elements.Count && elements[i + 1] is not CommandParameterAst)
+                    value = elements[++i];
+                if (callback && !IsVisiblePropertyDefinition(value)) return true;
+            }
+            else if (!IsVisiblePropertyDefinition(elements[i]))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static bool IsVisiblePropertyDefinition(Ast? value) => value switch
+    {
+        // A literal name or string is data; a visible callback is checked by
+        // the execution-aware AST walk. Variables may instead hold callbacks.
+        ConstantExpressionAst or ExpandableStringExpressionAst => true,
+        ScriptBlockExpressionAst => true,
+        ArrayLiteralAst array => array.Elements.All(IsVisiblePropertyDefinition),
+        ArrayExpressionAst array => IsVisiblePropertyDefinition(array.SubExpression),
+        ParenExpressionAst parens => IsVisiblePropertyDefinition(parens.Pipeline),
+        StatementBlockAst block => block.Statements.All(IsVisiblePropertyDefinition),
+        PipelineAst pipeline => pipeline.PipelineElements.Count == 1 &&
+            IsVisiblePropertyDefinition(pipeline.PipelineElements[0]),
+        CommandExpressionAst expression => IsVisiblePropertyDefinition(expression.Expression),
+        HashtableAst table => table.KeyValuePairs.All(pair =>
+            pair.Item1 is StringConstantExpressionAst key &&
+            (IsParameterPrefix(key.Value, "Expression")
+                ? IsVisiblePropertyDefinition(pair.Item2)
+                : IsParameterPrefix(key.Value, "Name", "Label", "Width", "Alignment", "FormatString",
+                    "Depth", "Ascending", "Descending"))),
+        _ => false
+    };
+
+    private static bool UsesUnresolvedScriptBlock(CommandAst command, string commandName)
+    {
+        var canonical = PsAliases.TryGetValue(commandName, out var alias) ? alias : commandName;
+        var isForEach = canonical.Equals("ForEach-Object", StringComparison.OrdinalIgnoreCase);
+        var isWhere = canonical.Equals("Where-Object", StringComparison.OrdinalIgnoreCase);
+        if (!isForEach && !isWhere) return false;
+
+        var elements = command.CommandElements;
+        for (int i = 1; i < elements.Count; i++)
+        {
+            if (elements[i] is CommandParameterAst parameter)
+            {
+                if (isForEach && IsParameterPrefix(parameter.ParameterName, "MemberName")) return true;
+                if (IsPowerShellSwitch(parameter.ParameterName)) continue;
+                var value = parameter.Argument ?? (i + 1 < elements.Count ? elements[++i] : null);
+                bool executable = isForEach
+                    ? IsParameterPrefix(parameter.ParameterName, "Begin", "End", "Process", "Parallel", "RemainingScripts")
+                    : IsParameterPrefix(parameter.ParameterName, "FilterScript");
+                if (executable && !IsLiteralScriptBlock(value)) return true;
+            }
+            else if (!IsLiteralScriptBlock(elements[i]) &&
+                     (isForEach || elements[i] is not StringConstantExpressionAst))
+            {
+                // ForEach's positional member syntax can invoke methods (e.g.
+                // Kill), while Where's ordinary property-name syntax is a filter.
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static bool IsLiteralScriptBlock(Ast? value) => value is ScriptBlockExpressionAst ||
+        value is ArrayLiteralAst array && array.Elements.All(element => element is ScriptBlockExpressionAst);
+
+    private static bool IsPowerShellSwitch(string parameterName) =>
+        IsParameterPrefix(parameterName, "Verbose", "Debug", "WhatIf", "Confirm", "AsJob", "UseNewRunspace");
+
+    private static bool IsParameterPrefix(string parameterName, params string[] names) =>
+        parameterName.Length > 0 && names.Any(name => name.StartsWith(parameterName, StringComparison.OrdinalIgnoreCase));
+
     private static Step DescribePowerShellStatement(string statement, Context ctx)
     {
         var elements = StatementSplitter.SplitPipeline(statement);
@@ -913,10 +1209,19 @@ public static class CommandExplainer
             case "foreach-object":
             case "where-object":
             {
-                var block = Regex.Match(text, @"\{(?<body>.*)\}", Opts | RegexOptions.Singleline);
-                if (block.Success)
+                // Keep the original description of a visible body, but do not
+                // mistake a script block supplied as data (e.g. -InputObject)
+                // for the callback that this command actually invokes.
+                var syntax = Parser.ParseInput(text, out _, out _);
+                var block = syntax.FindAll(node => node is ScriptBlockExpressionAst, true)
+                    .OfType<ScriptBlockExpressionAst>()
+                    .FirstOrDefault(candidate => IsInvokedScriptBlock(candidate) && IsExecutedPowerShellAst(candidate));
+                if (block is not null)
                 {
-                    var body = block.Groups["body"].Value.Trim();
+                    var blockText = block.Extent.Text;
+                    var body = blockText.Length > 1 && blockText.EndsWith('}')
+                        ? blockText[1..^1].Trim()
+                        : blockText.TrimStart('{').Trim();
                     var first = PsWords(body).FirstOrDefault() ?? "";
                     var firstCanonical = PsAliases.TryGetValue(first, out var a2) ? a2 : first;
                     if (Cmdlets.ContainsKey(firstCanonical) && !DataCmdlets.Contains(firstCanonical))
@@ -1010,7 +1315,7 @@ public static class CommandExplainer
             return new Step($"Starts a program: {Shorten(text, 140)}", "starts a program", false, Effects.LaunchesPrograms);
         if (Regex.IsMatch(text, @"\[(System\.)?IO\.File\]::(WriteAll\w*|AppendAll\w*|Copy|Move|Delete|Create)\s*\(", Opts))
             return new Step($"Writes/changes a file through .NET: {Shorten(text, 140)}", "writes a file", false, Effects.WritesFiles);
-        if (Regex.IsMatch(text, @"\[(System\.)?IO\.File\]::(ReadAll\w*|Exists|Open\w*)\s*\(", Opts))
+        if (Regex.IsMatch(text, @"\[(System\.)?IO\.File\]::(ReadAll\w*|Exists|OpenRead)\s*\(", Opts))
             return new Step($"Reads a file through .NET: {Shorten(text, 140)}", "reads a file", true, Effects.ReadsFiles);
         if (Regex.IsMatch(text, @"\[(System\.)?Convert\]::FromBase64String\s*\(", Opts))
             return new Step("Decodes Base64 data (often used to unpack a hidden payload).", "decodes Base64 data", true, Effects.DataProcessing);

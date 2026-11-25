@@ -106,7 +106,9 @@ public static class RiskAssessor
         }
         if (processSig is null || processSig.Status is SignatureStatus.Error or SignatureStatus.Unavailable or SignatureStatus.NotFound)
             result.Unknowns.Add($"The signature of {input.ProcessName} itself could not be checked.");
-        if (input.Explanation is null || input.Explanation.IsReadOnly is null)
+        if (input.Explanation?.IsReadOnly == false)
+            result.Unknowns.Add("The command makes changes or launches activity whose safety could not be established from the command line.");
+        else if (input.Explanation is null || input.Explanation.IsReadOnly is null)
             result.Unknowns.Add("Part of the command could not be interpreted, so its full effect is unknown.");
         if (input.Explanation?.ScriptPath is not null)
             result.Unknowns.Add($"The script {input.Explanation.ScriptPath} was run, but its contents are not part of the command line.");
@@ -121,7 +123,7 @@ public static class RiskAssessor
             result.Level = RiskLevel.High;
         else if (result.Score >= 25)
             result.Level = RiskLevel.Suspicious;
-        else if (!hasMediumOrWorse && launcherVerified && processVerified)
+        else if (!hasMediumOrWorse && launcherVerified && processVerified && input.Explanation?.IsReadOnly == true)
             result.Level = RiskLevel.Low;
         else
             result.Level = RiskLevel.Unknown;
@@ -152,7 +154,7 @@ public static class RiskAssessor
                 $"Low risk based on the evidence collected: {(input.Explanation?.IsReadOnly == true ? "the command only reads information, " : "")}it was launched by {launcherName} (signature verified) and the program itself is genuine. This is not proof that the computer is clean.",
             _ => (hasMediumOrWorse ? $"Some indicators ({Join(topReasons)}) but not enough evidence to judge. " : "No suspicious indicators were found in the command itself, but there isn't enough evidence to judge it. ") +
                  (result.Unknowns.FirstOrDefault() ?? "") +
-                 " The program that launched it still needs verification."
+                 " The command's effect or launch context still needs verification."
         };
 
         return result;
