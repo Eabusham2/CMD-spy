@@ -18,6 +18,7 @@
 
   <ItemGroup>
     <!-- Boot-start background service (ServiceBase / ServiceController). -->
+    <PackageReference Include="System.IO.FileSystem.AccessControl" Version="5.0.0" />
     <PackageReference Include="System.ServiceProcess.ServiceController" Version="8.0.1" />
   </ItemGroup>
 

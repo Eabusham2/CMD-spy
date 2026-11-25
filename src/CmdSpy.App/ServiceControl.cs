@@ -1,9 +1,15 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Cryptography;
+using System.Security.Principal;
 using System.ServiceProcess;
+using Microsoft.Win32.SafeHandles;
 
 namespace CmdSpy.App;
 
@@ -17,6 +23,38 @@ namespace CmdSpy.App;
 /// </summary>
 internal static class ServiceControl
 {
+    private const int MaximumInstallFiles = 2_000;
+    private const uint GenericRead = 0x80000000;
+    private const uint ReadControl = 0x00020000;
+    private const uint FileFlagBackupSemantics = 0x02000000;
+    private const uint FileFlagOpenReparsePoint = 0x00200000;
+    private const int GenericAllAccess = 0x10000000;
+    private const int GenericWriteAccess = 0x40000000;
+
+    private const FileSystemRights MutableRights =
+        FileSystemRights.WriteData |
+        FileSystemRights.AppendData |
+        FileSystemRights.WriteExtendedAttributes |
+        FileSystemRights.WriteAttributes |
+        FileSystemRights.DeleteSubdirectoriesAndFiles |
+        FileSystemRights.Delete |
+        FileSystemRights.ChangePermissions |
+        FileSystemRights.TakeOwnership;
+
+    private const int MutableAccessMask =
+        (int)MutableRights | GenericAllAccess | GenericWriteAccess;
+
+    private static readonly SecurityIdentifier AdministratorsSid =
+        new(WellKnownSidType.BuiltinAdministratorsSid, null);
+    private static readonly SecurityIdentifier LocalSystemSid =
+        new(WellKnownSidType.LocalSystemSid, null);
+    private static readonly SecurityIdentifier BuiltinUsersSid =
+        new(WellKnownSidType.BuiltinUsersSid, null);
+    private static readonly SecurityIdentifier TrustedInstallerSid =
+        new("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464");
+    private static readonly SecurityIdentifier OwnerRightsSid = new("S-1-3-4");
+    private static readonly SecurityIdentifier CreatorOwnerSid = new("S-1-3-0");
+
     public const string ServiceName = "CmdSpy";
     public const string DisplayName = "CMD-spy popup monitor";
     public const string Description =
@@ -178,46 +216,430 @@ internal static class ServiceControl
     // ------------------------------------------------------------ helpers --
 
     /// <summary>
-    /// Copies the running app into Program Files and returns the installed
-    /// executable. A single-file CmdSpy.exe is copied on its own; a regular
-    /// build folder (it contains CmdSpy.Core.dll) is copied as a whole.
+    /// Copies an administrator-owned snapshot of the running app into Program
+    /// Files and returns the installed executable. A single-file CmdSpy.exe is
+    /// copied on its own; a regular build folder (it contains CmdSpy.Core.dll)
+    /// is copied as a whole.
     /// </summary>
     private static string CopyToInstallDirectory(List<string> log)
     {
-        var source = Path.GetFullPath(AppContext.BaseDirectory).TrimEnd('\\');
-        var target = Path.GetFullPath(InstallDirectory).TrimEnd('\\');
+        var source = Path.TrimEndingDirectorySeparator(Path.GetFullPath(AppContext.BaseDirectory));
+        var target = Path.TrimEndingDirectorySeparator(Path.GetFullPath(InstallDirectory));
         var host = Environment.ProcessPath ?? throw new InvalidOperationException("Cannot locate CmdSpy.exe.");
         var usesDotnetHost = Path.GetFileNameWithoutExtension(host).Equals("dotnet", StringComparison.OrdinalIgnoreCase);
-        var appFile = usesDotnetHost ? Path.Combine(source, "CmdSpy.dll") : host;
+        var appFile = Path.GetFullPath(usesDotnetHost ? Path.Combine(source, "CmdSpy.dll") : host);
+        var appFileName = Path.GetFileName(appFile);
 
         if (string.Equals(source, target, StringComparison.OrdinalIgnoreCase))
         {
+            bool installedAsDirectory = File.Exists(Path.Combine(source, "CmdSpy.Core.dll"));
+            using var installed = OpenTrustedBundle(source, appFileName, installedAsDirectory);
+            EnsureAppFilePresent(installed, appFileName);
             log.Add($"Using the installed copy in {target}.");
-            return Path.Combine(target, Path.GetFileName(appFile));
+            return Path.Combine(target, appFileName);
         }
 
-        Directory.CreateDirectory(target);
-        if (File.Exists(Path.Combine(source, "CmdSpy.Core.dll")))
+        if (!string.Equals(Path.GetDirectoryName(appFile), source, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("The running CMD-spy executable is outside its application directory.");
+
+        bool copyDirectory = File.Exists(Path.Combine(source, "CmdSpy.Core.dll"));
+        using var bundle = OpenTrustedBundle(source, appFileName, copyDirectory);
+        EnsureAppFilePresent(bundle, appFileName);
+        var manifest = CreateManifest(bundle);
+
+        var staging = target + ".staging-" + Guid.NewGuid().ToString("N");
+        var backup = target + ".backup-" + Guid.NewGuid().ToString("N");
+        bool oldMoved = false;
+        bool stagedAtTarget = false;
+        try
         {
-            var files = Directory.GetFiles(source, "*", SearchOption.AllDirectories);
-            if (files.Length > 2_000)
-                throw new InvalidOperationException(
-                    $"{source} holds {files.Length} files — put CMD-spy in its own folder before installing the service.");
-            foreach (var file in files)
+            CreateSecureDirectory(staging);
+            foreach (var file in bundle.Files)
             {
-                var relative = Path.GetRelativePath(source, file);
-                var destination = Path.Combine(target, relative);
-                Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-                File.Copy(file, destination, overwrite: true);
+                var destination = Path.Combine(staging, file.RelativePath);
+                CreateSecureDirectoryTree(staging, Path.GetDirectoryName(destination)!);
+                file.Stream.Position = 0;
+                using var output = CreateSecureFile(destination);
+                file.Stream.CopyTo(output);
+                output.Flush(flushToDisk: true);
             }
-            log.Add($"✓ Copied CMD-spy ({files.Length} files) to {target}.");
+
+            VerifySourceUnchanged(bundle, manifest);
+            VerifyBundle(staging, appFileName, copyDirectory, manifest);
+
+            if (File.Exists(target))
+                throw new InvalidOperationException($"The install path {target} is a file, not a directory.");
+            if (Directory.Exists(target))
+            {
+                RejectReparsePoint(target);
+                Directory.Move(target, backup);
+                oldMoved = true;
+            }
+
+            Directory.Move(staging, target);
+            stagedAtTarget = true;
+            VerifyBundle(target, appFileName, copyDirectory, manifest);
         }
-        else
+        catch
         {
-            File.Copy(appFile, Path.Combine(target, Path.GetFileName(appFile)), overwrite: true);
-            log.Add($"✓ Copied {Path.GetFileName(appFile)} to {target}.");
+            if (stagedAtTarget && Directory.Exists(target) && !Directory.Exists(staging))
+            {
+                Directory.Move(target, staging);
+                stagedAtTarget = false;
+            }
+            if (oldMoved && !Directory.Exists(target))
+            {
+                Directory.Move(backup, target);
+                oldMoved = false;
+            }
+            throw;
         }
-        return Path.Combine(target, Path.GetFileName(appFile));
+        finally
+        {
+            if (Directory.Exists(staging))
+                Directory.Delete(staging, recursive: true);
+        }
+
+        if (oldMoved && Directory.Exists(backup))
+        {
+            try { Directory.Delete(backup, recursive: true); }
+            catch (Exception ex) { log.Add($"Could not remove the previous installed files: {ex.Message}"); }
+        }
+
+        log.Add(copyDirectory
+            ? $"✓ Copied and verified CMD-spy ({bundle.Files.Count} files) in {target}."
+            : $"✓ Copied and verified {appFileName} in {target}.");
+        return Path.Combine(target, appFileName);
+    }
+
+    private static SourceBundle OpenTrustedBundle(string root, string appFileName, bool copyDirectory)
+    {
+        var bundle = new SourceBundle();
+        try
+        {
+            bundle.DirectoryHandles.Add(OpenTrustedEntry(root, requireDirectory: true));
+            if (!copyDirectory)
+            {
+                AddTrustedFile(bundle, root, Path.Combine(root, appFileName));
+                return bundle;
+            }
+
+            var pending = new Queue<string>();
+            pending.Enqueue(root);
+            while (pending.Count > 0)
+            {
+                var directory = pending.Dequeue();
+                foreach (var entry in Directory.EnumerateFileSystemEntries(directory, "*", new EnumerationOptions
+                {
+                    AttributesToSkip = 0,
+                    IgnoreInaccessible = false,
+                    RecurseSubdirectories = false,
+                    ReturnSpecialDirectories = false
+                }))
+                {
+                    SafeFileHandle? handle = OpenTrustedEntry(entry, requireDirectory: null);
+                    try
+                    {
+                        if (IsDirectory(handle))
+                        {
+                            bundle.DirectoryHandles.Add(handle);
+                            handle = null;
+                            pending.Enqueue(entry);
+                            continue;
+                        }
+
+                        if (bundle.Files.Count >= MaximumInstallFiles)
+                            throw new InvalidOperationException(
+                                $"{root} holds more than {MaximumInstallFiles} files — put CMD-spy in its own folder before installing the service.");
+                        AddTrustedFile(bundle, root, entry, handle);
+                        handle = null;
+                    }
+                    finally
+                    {
+                        handle?.Dispose();
+                    }
+                }
+            }
+
+            bundle.Files.Sort((left, right) =>
+                StringComparer.OrdinalIgnoreCase.Compare(left.RelativePath, right.RelativePath));
+            return bundle;
+        }
+        catch
+        {
+            bundle.Dispose();
+            throw;
+        }
+    }
+
+    private static void AddTrustedFile(SourceBundle bundle, string root, string path, SafeFileHandle? handle = null)
+    {
+        handle ??= OpenTrustedEntry(path, requireDirectory: false);
+        try
+        {
+            var relative = Path.GetRelativePath(root, path);
+            if (Path.IsPathRooted(relative) || relative.Equals("..", StringComparison.Ordinal) ||
+                relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+                throw new InvalidOperationException($"Installation file {path} is outside {root}.");
+            if (bundle.Files.Any(file => file.RelativePath.Equals(relative, StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidOperationException($"Installation source contains duplicate path {relative}.");
+
+            var stream = new FileStream(handle, FileAccess.Read);
+            handle = null;
+            bundle.Files.Add(new SourceFile(relative, stream));
+        }
+        finally
+        {
+            handle?.Dispose();
+        }
+    }
+
+    private static SafeFileHandle OpenTrustedEntry(string path, bool? requireDirectory)
+    {
+        var handle = CreateFile(
+            path,
+            GenericRead | ReadControl,
+            FileShare.Read,
+            IntPtr.Zero,
+            FileMode.Open,
+            FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(error, $"Could not lock installation source {path} for verification.");
+        }
+
+        try
+        {
+            var attributes = GetAttributes(handle, path);
+            if ((attributes & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidOperationException($"Installation source contains a reparse point: {path}");
+
+            bool isDirectory = (attributes & FileAttributes.Directory) != 0;
+            if (requireDirectory.HasValue && requireDirectory.Value != isDirectory)
+                throw new InvalidOperationException(requireDirectory.Value
+                    ? $"Installation directory does not exist: {path}"
+                    : $"Installation file does not exist: {path}");
+
+            EnsureTrustedSecurity(path, isDirectory);
+            return handle;
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    private static void EnsureTrustedSecurity(string path, bool isDirectory)
+    {
+        FileSystemSecurity security = isDirectory
+            ? FileSystemAclExtensions.GetAccessControl(
+                new DirectoryInfo(path), AccessControlSections.Owner | AccessControlSections.Access)
+            : FileSystemAclExtensions.GetAccessControl(
+                new FileInfo(path), AccessControlSections.Owner | AccessControlSections.Access);
+
+        var owner = (SecurityIdentifier)security.GetOwner(typeof(SecurityIdentifier));
+        if (!IsTrustedPrivilegedSid(owner))
+            throw UnsafeSource(path, $"its owner is {owner.Value}");
+
+        var descriptor = new RawSecurityDescriptor(security.GetSecurityDescriptorBinaryForm(), 0);
+        if ((descriptor.ControlFlags & ControlFlags.DiscretionaryAclPresent) == 0 ||
+            descriptor.DiscretionaryAcl is null)
+            throw UnsafeSource(path, "it has no restrictive access-control list");
+
+        foreach (GenericAce genericAce in descriptor.DiscretionaryAcl)
+        {
+            if (genericAce is not QualifiedAce ace ||
+                ace.AceQualifier != AceQualifier.AccessAllowed ||
+                (ace.AceFlags & AceFlags.InheritOnly) != 0 ||
+                (ace.AccessMask & MutableAccessMask) == 0)
+                continue;
+
+            if (!IsTrustedPrivilegedSid(ace.SecurityIdentifier) &&
+                !ace.SecurityIdentifier.Equals(OwnerRightsSid) &&
+                !ace.SecurityIdentifier.Equals(CreatorOwnerSid))
+                throw UnsafeSource(path, $"{ace.SecurityIdentifier.Value} can modify it");
+        }
+    }
+
+    private static InvalidOperationException UnsafeSource(string path, string reason) => new(
+        $"Service installation was refused because {path} is not an administrator-owned source: {reason}. " +
+        "Move CMD-spy to a directory owned by SYSTEM, TrustedInstaller, or BUILTIN\\Administrators and try again.");
+
+    private static bool IsTrustedPrivilegedSid(SecurityIdentifier sid) =>
+        sid.Equals(AdministratorsSid) || sid.Equals(LocalSystemSid) || sid.Equals(TrustedInstallerSid);
+
+    private static Dictionary<string, byte[]> CreateManifest(SourceBundle bundle)
+    {
+        var manifest = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in bundle.Files)
+            manifest.Add(file.RelativePath, Hash(file.Stream));
+        return manifest;
+    }
+
+    private static void VerifySourceUnchanged(SourceBundle bundle, IReadOnlyDictionary<string, byte[]> manifest)
+    {
+        foreach (var file in bundle.Files)
+        {
+            if (!CryptographicOperations.FixedTimeEquals(manifest[file.RelativePath], Hash(file.Stream)))
+                throw new InvalidOperationException($"Installation source changed while copying {file.RelativePath}.");
+        }
+    }
+
+    private static void VerifyBundle(
+        string root,
+        string appFileName,
+        bool copyDirectory,
+        IReadOnlyDictionary<string, byte[]> manifest)
+    {
+        using var installed = OpenTrustedBundle(root, appFileName, copyDirectory);
+        EnsureAppFilePresent(installed, appFileName);
+        if (installed.Files.Count != manifest.Count)
+            throw new InvalidOperationException($"Installed bundle in {root} does not match the verified source.");
+
+        foreach (var file in installed.Files)
+        {
+            if (!manifest.TryGetValue(file.RelativePath, out var expected) ||
+                !CryptographicOperations.FixedTimeEquals(expected, Hash(file.Stream)))
+                throw new InvalidOperationException($"Installed file {file.RelativePath} does not match the verified source.");
+        }
+    }
+
+    private static void EnsureAppFilePresent(SourceBundle bundle, string appFileName)
+    {
+        if (!bundle.Files.Any(file => file.RelativePath.Equals(appFileName, StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidOperationException($"Installation source does not contain {appFileName}.");
+    }
+
+    private static byte[] Hash(Stream stream)
+    {
+        stream.Position = 0;
+        var hash = SHA256.HashData(stream);
+        stream.Position = 0;
+        return hash;
+    }
+
+    private static void CreateSecureDirectoryTree(string root, string directory)
+    {
+        if (string.Equals(root, directory, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        var parent = Path.GetDirectoryName(directory)
+            ?? throw new InvalidOperationException($"Cannot determine the parent of {directory}.");
+        CreateSecureDirectoryTree(root, parent);
+        if (!Directory.Exists(directory))
+            CreateSecureDirectory(directory);
+    }
+
+    private static void CreateSecureDirectory(string path)
+    {
+        var security = new DirectorySecurity();
+        security.SetOwner(AdministratorsSid);
+        security.SetGroup(AdministratorsSid);
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        var inheritance = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
+        security.AddAccessRule(new FileSystemAccessRule(
+            LocalSystemSid, FileSystemRights.FullControl, inheritance, PropagationFlags.None, AccessControlType.Allow));
+        security.AddAccessRule(new FileSystemAccessRule(
+            AdministratorsSid, FileSystemRights.FullControl, inheritance, PropagationFlags.None, AccessControlType.Allow));
+        security.AddAccessRule(new FileSystemAccessRule(
+            BuiltinUsersSid, FileSystemRights.ReadAndExecute, inheritance, PropagationFlags.None, AccessControlType.Allow));
+        FileSystemAclExtensions.Create(new DirectoryInfo(path), security);
+    }
+
+    private static FileStream CreateSecureFile(string path)
+    {
+        var security = new FileSecurity();
+        security.SetOwner(AdministratorsSid);
+        security.SetGroup(AdministratorsSid);
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        security.AddAccessRule(new FileSystemAccessRule(LocalSystemSid, FileSystemRights.FullControl, AccessControlType.Allow));
+        security.AddAccessRule(new FileSystemAccessRule(AdministratorsSid, FileSystemRights.FullControl, AccessControlType.Allow));
+        security.AddAccessRule(new FileSystemAccessRule(BuiltinUsersSid, FileSystemRights.ReadAndExecute, AccessControlType.Allow));
+        return FileSystemAclExtensions.Create(
+            new FileInfo(path),
+            FileMode.CreateNew,
+            FileSystemRights.FullControl,
+            FileShare.None,
+            64 * 1024,
+            FileOptions.SequentialScan,
+            security);
+    }
+
+    private static void RejectReparsePoint(string path)
+    {
+        if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+            throw new InvalidOperationException($"The install path is a reparse point: {path}");
+    }
+
+    private static bool IsDirectory(SafeFileHandle handle) =>
+        (GetAttributes(handle, "installation source") & FileAttributes.Directory) != 0;
+
+    private static FileAttributes GetAttributes(SafeFileHandle handle, string path)
+    {
+        if (!GetFileInformationByHandle(handle, out var information))
+            throw new Win32Exception(Marshal.GetLastWin32Error(), $"Could not inspect {path}.");
+        return (FileAttributes)information.FileAttributes;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "CreateFileW")]
+    private static extern SafeFileHandle CreateFile(
+        string fileName,
+        uint desiredAccess,
+        FileShare shareMode,
+        IntPtr securityAttributes,
+        FileMode creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(
+        SafeFileHandle file,
+        out ByHandleFileInformation information);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ByHandleFileInformation
+    {
+        public uint FileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    private sealed class SourceFile : IDisposable
+    {
+        public SourceFile(string relativePath, FileStream stream)
+        {
+            RelativePath = relativePath;
+            Stream = stream;
+        }
+
+        public string RelativePath { get; }
+        public FileStream Stream { get; }
+        public void Dispose() => Stream.Dispose();
+    }
+
+    private sealed class SourceBundle : IDisposable
+    {
+        public List<SourceFile> Files { get; } = new();
+        public List<SafeFileHandle> DirectoryHandles { get; } = new();
+
+        public void Dispose()
+        {
+            foreach (var file in Files)
+                file.Dispose();
+            foreach (var handle in DirectoryHandles)
+                handle.Dispose();
+        }
     }
 
     /// <summary>The service command line: <c>"...\CmdSpy.exe" --service</c> (or via the dotnet host for a .dll build).</summary>
