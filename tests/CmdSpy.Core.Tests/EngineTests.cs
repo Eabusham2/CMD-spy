@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using CmdSpy.Core.Models;
@@ -110,6 +111,91 @@ public class EngineTests : IDisposable
         Assert.NotNull(captured);
         Assert.Empty(captured!.ChildProcesses);
         Assert.NotNull(captured.ExitedAtUtc);
+    }
+
+    [Fact]
+    public void DelayedStopForReusedPidDoesNotFinalizeTheNewPopup()
+    {
+        using var engine = NewEngine();
+        var captured = new List<CmdEvent>();
+        engine.EventCaptured += (_, ev) => captured.Add(ev);
+        var t = DateTimeOffset.UtcNow;
+
+        LaunchChain(t);
+        _watcher.Started(Cmd, Updater, "cmd.exe", "cmd.exe /c first", t.AddMilliseconds(1));
+        _watcher.Started(Cmd, Updater, "cmd.exe", "cmd.exe /c second", t.AddSeconds(1));
+
+        // The old stop arrives after PID reuse, but its timestamp precedes the new start.
+        _watcher.Stopped(Cmd, t.AddMilliseconds(10));
+
+        var newer = captured.Single(ev => ev.CommandLine == "cmd.exe /c second");
+        Assert.Null(newer.ExitedAtUtc);
+
+        _watcher.Stopped(Cmd, t.AddSeconds(2), exitCode: 7);
+        Assert.Equal(t.AddSeconds(2), newer.ExitedAtUtc);
+        Assert.Equal(7, newer.ExitCode);
+    }
+
+    [Fact]
+    public void DelayedNetworkEventAcrossPidReuseReachesTheOriginalPopup()
+    {
+        using var engine = NewEngine(network: true);
+        var captured = new List<CmdEvent>();
+        engine.EventCaptured += (_, ev) => captured.Add(ev);
+        var t = DateTimeOffset.UtcNow;
+
+        LaunchChain(t);
+        _watcher.Started(Cmd, Updater, "cmd.exe", "cmd.exe /c first", t.AddMilliseconds(1));
+        _watcher.Stopped(Cmd, t.AddMilliseconds(10));
+        _watcher.Started(Cmd, Updater, "cmd.exe", "cmd.exe /c second", t.AddMilliseconds(20));
+
+        NetworkConnectionInfo Conn(int port, double atMs) => new()
+        {
+            Protocol = "TCP", LocalAddress = "10.0.0.2", LocalPort = port,
+            RemoteAddress = "93.184.216.34", RemotePort = 443, State = "CONNECT",
+            OwningPid = Cmd, Source = "ETW", ObservedAtUtc = t.AddMilliseconds(atMs)
+        };
+
+        // Both callbacks arrive after reuse; their timestamps identify different incarnations.
+        engine.OnConnectionObserved(Cmd, Conn(50100, 5));
+        engine.OnConnectionObserved(Cmd, Conn(50101, 25));
+
+        var older = captured.Single(ev => ev.CommandLine == "cmd.exe /c first");
+        var newer = captured.Single(ev => ev.CommandLine == "cmd.exe /c second");
+        Assert.Contains(older.NetworkConnections, c => c.LocalPort == 50100);
+        Assert.DoesNotContain(newer.NetworkConnections, c => c.LocalPort == 50100);
+        Assert.Contains(newer.NetworkConnections, c => c.LocalPort == 50101);
+        Assert.DoesNotContain(older.NetworkConnections, c => c.LocalPort == 50101);
+    }
+
+    [Fact]
+    public void DelayedDescendantStopDoesNotRemoveTheReusedChild()
+    {
+        using var engine = NewEngine(network: true);
+        CmdEvent? captured = null;
+        engine.EventCaptured += (_, ev) => captured = ev;
+        var t = DateTimeOffset.UtcNow;
+
+        LaunchChain(t);
+        _watcher.Started(Cmd, Updater, "cmd.exe", "cmd.exe /c tools", t.AddMilliseconds(1));
+        _watcher.Started(Ping, Cmd, "first.exe", "first.exe", t.AddMilliseconds(5));
+        _watcher.Started(Ping, Cmd, "second.exe", "second.exe", t.AddMilliseconds(20));
+
+        // The first child's stop is delivered after the PID has been assigned again.
+        _watcher.Stopped(Ping, t.AddMilliseconds(10));
+        engine.OnConnectionObserved(Ping, new NetworkConnectionInfo
+        {
+            Protocol = "TCP", LocalAddress = "10.0.0.2", LocalPort = 50102,
+            RemoteAddress = "93.184.216.34", RemotePort = 443, State = "CONNECT",
+            OwningPid = Ping, Source = "ETW", ObservedAtUtc = t.AddMilliseconds(25)
+        });
+
+        Assert.NotNull(captured);
+        var older = captured!.ChildProcesses.Single(p => p.CommandLine == "first.exe");
+        var newer = captured.ChildProcesses.Single(p => p.CommandLine == "second.exe");
+        Assert.Equal(t.AddMilliseconds(10), older.ExitedAtUtc);
+        Assert.Null(newer.ExitedAtUtc);
+        Assert.Contains(captured.NetworkConnections, c => c.LocalPort == 50102);
     }
 
     [Fact]

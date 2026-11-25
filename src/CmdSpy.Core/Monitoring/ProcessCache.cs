@@ -148,22 +148,51 @@ public sealed class ProcessCache
         return record;
     }
 
-    /// <summary>Records a process exit, against the incarnation that was running.</summary>
-    public void RecordStop(ProcessStoppedEventArgs e)
+    /// <summary>Records a process exit against the incarnation that was running.</summary>
+    public void RecordStop(ProcessStoppedEventArgs e) => RecordStopAndGet(e);
+
+    /// <summary>
+    /// Records a process exit against the latest incarnation that had actually
+    /// started by the exit timestamp, and returns that incarnation.
+    /// </summary>
+    internal ProcessRecord? RecordStopAndGet(ProcessStoppedEventArgs e)
     {
         lock (_gate)
         {
-            if (!_byPid.TryGetValue(e.ProcessId, out var list)) return;
+            if (!_byPid.TryGetValue(e.ProcessId, out var list)) return null;
             for (int i = list.Count - 1; i >= 0; i--)
             {
                 var r = list[i];
-                if (r.ExitTimeUtc is null && r.StartTimeUtc <= e.TimestampUtc + Skew)
+                // A process that starts after this stop is a different PID
+                // incarnation, even when the timestamps are within Skew.
+                if (r.ExitTimeUtc is null && r.StartTimeUtc <= e.TimestampUtc)
                 {
                     r.ExitTimeUtc = e.TimestampUtc;
                     r.ExitCode = e.ExitCode;
-                    return;
+                    return r.Clone();
                 }
             }
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// True when the PID incarnation identified by its exact start time was the
+    /// latest known incarnation alive at <paramref name="asOfUtc"/>.
+    /// </summary>
+    internal bool IsIncarnationAliveAt(int processId, DateTimeOffset startTimeUtc, DateTimeOffset asOfUtc)
+    {
+        lock (_gate)
+        {
+            if (!_byPid.TryGetValue(processId, out var list)) return false;
+            for (int i = list.Count - 1; i >= 0; i--)
+            {
+                var r = list[i];
+                if (r.StartTimeUtc > asOfUtc) continue;
+                return r.StartTimeUtc == startTimeUtc &&
+                       (r.ExitTimeUtc is null || asOfUtc <= r.ExitTimeUtc.Value);
+            }
+            return false;
         }
     }
 

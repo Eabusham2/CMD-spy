@@ -255,11 +255,7 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
     /// <paramref name="expectedStartUtc"/> — i.e. the PID wasn't recycled.
     /// </summary>
     private bool IsSameIncarnation(int pid, DateTimeOffset expectedStartUtc, DateTimeOffset asOfUtc)
-    {
-        var record = _processes.TryGet(pid, asOfUtc);
-        if (record is null || record.StartTimeUtc == DateTimeOffset.MinValue) return true;
-        return (record.StartTimeUtc - expectedStartUtc).Duration() <= ProcessCache.Skew;
-    }
+        => _processes.IsIncarnationAliveAt(pid, expectedStartUtc, asOfUtc);
 
     private void CaptureCmdPopup(ProcessStartedEventArgs e)
     {
@@ -427,10 +423,13 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
 
     private void OnProcessStopped(object? sender, ProcessStoppedEventArgs e)
     {
-        _processes.RecordStop(e);
-        RecordDescendantExit(e);
+        var stopped = _processes.RecordStopAndGet(e);
+        RecordDescendantExit(e, stopped);
 
-        if (!_active.TryRemove(e.ProcessId, out var ev)) return;
+        if (stopped is null ||
+            !_active.TryGetValue(e.ProcessId, out var ev) ||
+            stopped.StartTimeUtc != ev.TimestampUtc ||
+            !_active.TryRemove(new KeyValuePair<int, CmdEvent>(e.ProcessId, ev))) return;
         _recentlyExited[e.ProcessId] = new ExitedLink(ev, ev.TimestampUtc, e.TimestampUtc);
 
         bool analysisPending;
@@ -458,16 +457,21 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
         _store.AppendUpdate(ev, _finalWritten.TryAdd(ev.Id, 0) ? "exit" : "exit-update");
 
     /// <summary>Marks a descendant's exit in the popup(s) it belongs to (persisted with the next snapshot).</summary>
-    private void RecordDescendantExit(ProcessStoppedEventArgs e)
+    private void RecordDescendantExit(ProcessStoppedEventArgs e, ProcessRecord? stopped)
     {
+        if (stopped is null) return;
+
         var owners = new List<CmdEvent>(2);
-        if (_descendants.TryRemove(e.ProcessId, out var link))
+        if (_descendants.TryGetValue(e.ProcessId, out var link) &&
+            link.StartUtc == stopped.StartTimeUtc &&
+            _descendants.TryRemove(new KeyValuePair<int, DescendantLink>(e.ProcessId, link)))
         {
             owners.Add(link.Root);
             _recentlyExitedDescendants[e.ProcessId] = new ExitedLink(link.Root, link.StartUtc, e.TimestampUtc);
         }
-        var record = _processes.TryGet(e.ProcessId, e.TimestampUtc);
-        if (record is not null && _active.TryGetValue(record.ParentProcessId, out var directParent) && !owners.Contains(directParent))
+        if (_active.TryGetValue(stopped.ParentProcessId, out var directParent) &&
+            IsSameIncarnation(stopped.ParentProcessId, directParent.TimestampUtc, stopped.StartTimeUtc) &&
+            !owners.Contains(directParent))
             owners.Add(directParent);
 
         foreach (var owner in owners)
@@ -477,7 +481,9 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
                 for (int i = owner.ChildProcesses.Count - 1; i >= 0; i--)
                 {
                     var child = owner.ChildProcesses[i];
-                    if (child.ProcessId == e.ProcessId && child.ExitedAtUtc is null)
+                    if (child.ProcessId == e.ProcessId &&
+                        child.StartTimeUtc == stopped.StartTimeUtc &&
+                        child.ExitedAtUtc is null)
                     {
                         child.ExitedAtUtc = e.TimestampUtc;
                         child.ExitCode = e.ExitCode;
@@ -549,16 +555,21 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
     internal void OnConnectionObserved(int pid, NetworkConnectionInfo connection)
     {
         if (!_options.CaptureNetwork || !_options.CaptureNetworkEvents) return;
+        if (connection.ObservedAtUtc is null) return; // A PID alone cannot identify an incarnation.
 
         var targets = new List<CmdEvent>(2);
-        if (_active.TryGetValue(pid, out var own)) targets.Add(own);
-        else if (_recentlyExited.TryGetValue(pid, out var gone) && Within(connection, gone)) targets.Add(gone.Event);
+        if (_active.TryGetValue(pid, out var own) && Within(connection, pid, own.TimestampUtc))
+            targets.Add(own);
+        else if (_recentlyExited.TryGetValue(pid, out var gone) &&
+                 Within(connection, pid, gone.StartUtc, gone.ExitUtc))
+            targets.Add(gone.Event);
 
-        if (_descendants.TryGetValue(pid, out var link))
+        if (_descendants.TryGetValue(pid, out var link) && Within(connection, pid, link.StartUtc))
         {
             if (!targets.Contains(link.Root)) targets.Add(link.Root);
         }
-        else if (_recentlyExitedDescendants.TryGetValue(pid, out var goneChild) && Within(connection, goneChild) &&
+        else if (_recentlyExitedDescendants.TryGetValue(pid, out var goneChild) &&
+                 Within(connection, pid, goneChild.StartUtc, goneChild.ExitUtc) &&
                  !targets.Contains(goneChild.Event))
         {
             targets.Add(goneChild.Event);
@@ -586,10 +597,17 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
         EventUpdated?.Invoke(this, target);
     }
 
-    /// <summary>True if the connection happened while that (now exited) process was alive.</summary>
-    private static bool Within(NetworkConnectionInfo connection, ExitedLink link) =>
-        connection.ObservedAtUtc is not { } at ||
-        (at >= link.StartUtc - ProcessCache.Skew && at <= link.ExitUtc + ProcessCache.Skew);
+    /// <summary>True if the timestamp belongs to this exact PID incarnation's lifetime.</summary>
+    private bool Within(
+        NetworkConnectionInfo connection,
+        int pid,
+        DateTimeOffset startUtc,
+        DateTimeOffset? exitUtc = null)
+    {
+        if (connection.ObservedAtUtc is not { } at || at < startUtc || (exitUtc is { } exit && at > exit))
+            return false;
+        return _processes.IsIncarnationAliveAt(pid, startUtc, at);
+    }
 
     private void PruneRecentlyExited(DateTimeOffset nowUtc)
     {
@@ -622,7 +640,7 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
         List<NetworkConnectionInfo> buffered;
         lock (list) buffered = list.ToList();
         foreach (var c in buffered)
-            if (c.ObservedAtUtc is null || c.ObservedAtUtc >= startUtc - ProcessCache.Skew)
+            if (Within(c, pid, startUtc))
                 AddConnection(target, c);
     }
 

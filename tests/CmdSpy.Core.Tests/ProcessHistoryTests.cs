@@ -61,6 +61,23 @@ public class ProcessHistoryTests
     }
 
     [Fact]
+    public void DelayedStopDoesNotExitANewerReusedPid()
+    {
+        var cache = new ProcessCache();
+        var first = cache.RecordStart(Start(300, 100, "first.exe", T0));
+        var second = cache.RecordStart(Start(300, 100, "second.exe", T0.AddSeconds(1)));
+
+        // The first process's stop is delivered after the second start, but its
+        // source timestamp still identifies the older incarnation.
+        var stopped = cache.RecordStopAndGet(Stop(300, T0.AddMilliseconds(500)));
+
+        Assert.Equal(first.StartTimeUtc, stopped!.StartTimeUtc);
+        Assert.Equal(T0.AddMilliseconds(500), first.ExitTimeUtc);
+        Assert.Null(second.ExitTimeUtc);
+        Assert.True(cache.IsIncarnationAliveAt(300, second.StartTimeUtc, T0.AddSeconds(2)));
+    }
+
+    [Fact]
     public void AncestryWalksToTheOriginalLauncher()
     {
         var cache = new ProcessCache();
