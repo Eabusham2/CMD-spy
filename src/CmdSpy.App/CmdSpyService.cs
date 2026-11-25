@@ -42,8 +42,9 @@ internal sealed class CmdSpyService : ServiceBase
             EtwNetworkSessionName = NetworkSessionName
         };
         _engine = new CmdSpyEngine(options);
-        _engine.Status += (_, message) => WriteStatus(options.LogDirectory, message);
-        WriteStatus(options.LogDirectory, $"Service starting ({Core.Monitoring.SystemTimings.Uptime.TotalSeconds:0} s after boot).");
+        var logDirectory = _engine.Store.Directory;
+        _engine.Status += (_, message) => WriteStatus(logDirectory, message);
+        WriteStatus(logDirectory, $"Service starting ({Core.Monitoring.SystemTimings.Uptime.TotalSeconds:0} s after boot).");
         _engine.Start();
     }
 

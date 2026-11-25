@@ -38,8 +38,7 @@ public sealed class EventStore
 
     public EventStore(string directory)
     {
-        _directory = directory;
-        System.IO.Directory.CreateDirectory(_directory);
+        _directory = LogDirectorySecurity.Prepare(directory);
     }
 
     public string Directory => _directory;
