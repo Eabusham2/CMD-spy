@@ -223,6 +223,93 @@ public class LogAndHistoryTests : IDisposable
 
     // ------------------------------------------------------- history import --
 
+    private static HistoricalEvent HistoricalLaunch(string source, DateTimeOffset at, int? pid = 37900,
+        string user = @"CONTOSO\analyst", string sid = "S-1-5-21-1000", string processGuid = "{PROCESS-A}") => new()
+    {
+        TimeUtc = at,
+        Source = source,
+        SourceRecordId = source == "Sysmon 1" ? 100 : 200,
+        EventId = source == "Sysmon 1" ? 1 : 4688,
+        ProcessId = pid,
+        ProcessGuid = processGuid,
+        Image = @"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        CommandLine = "powershell.exe -NoProfile -Command whoami",
+        User = user,
+        UserSid = sid,
+        LogonId = "0x12345",
+        SessionId = 2
+    };
+
+    [Fact]
+    public void HistoryDedup_RetainsSameCommandFromDifferentPrincipalsAndProcesses()
+    {
+        var at = new DateTimeOffset(2026, 11, 24, 12, 0, 0, TimeSpan.Zero);
+        var victim = HistoricalLaunch("Sysmon 1", at, pid: 37900);
+        var attacker = HistoricalLaunch("Security 4688", at.AddMilliseconds(50), pid: 41200,
+            user: @"CONTOSO\attacker", sid: "S-1-5-21-2000", processGuid: "{PROCESS-B}");
+
+        var result = WindowsEventHistory.DeduplicateProcessHistory(new[] { victim, attacker }, 10);
+
+        Assert.Equal(2, result.Count);
+        Assert.Contains(result, e => e.User == @"CONTOSO\analyst" && e.ProcessId == 37900);
+        Assert.Contains(result, e => e.User == @"CONTOSO\attacker" && e.ProcessId == 41200);
+    }
+
+    [Fact]
+    public void HistoryDedup_RetainsConflictingProcessIncarnations()
+    {
+        var at = new DateTimeOffset(2026, 11, 24, 12, 0, 0, TimeSpan.Zero);
+        var first = HistoricalLaunch("Sysmon 1", at, processGuid: "{PROCESS-A}");
+        var second = HistoricalLaunch("Security 4688", at.AddMilliseconds(50), processGuid: "{PROCESS-B}");
+
+        var result = WindowsEventHistory.DeduplicateProcessHistory(new[] { first, second }, 10);
+
+        Assert.Equal(2, result.Count);
+    }
+
+    [Fact]
+    public void HistoryDedup_RetainsLaunchesOutsideTightStartWindow()
+    {
+        var at = new DateTimeOffset(2026, 11, 24, 12, 0, 0, TimeSpan.Zero);
+        var first = HistoricalLaunch("Sysmon 1", at);
+        var second = HistoricalLaunch("Security 4688", at + HistoricalLaunchIdentity.MaximumTimeSkew + TimeSpan.FromMilliseconds(1));
+        second.ProcessGuid = null;
+
+        var result = WindowsEventHistory.DeduplicateProcessHistory(new[] { first, second }, 10);
+
+        Assert.Equal(2, result.Count);
+    }
+
+    [Fact]
+    public void HistoryDedup_RetainsCommandOnlyEvidence()
+    {
+        var at = new DateTimeOffset(2026, 11, 24, 12, 0, 0, TimeSpan.Zero);
+        var identified = HistoricalLaunch("Sysmon 1", at);
+        var ambiguous = HistoricalLaunch("PowerShell 400", at.AddMilliseconds(50), pid: null);
+        ambiguous.ProcessGuid = null;
+        ambiguous.User = null;
+        ambiguous.UserSid = null;
+        ambiguous.LogonId = null;
+        ambiguous.SessionId = null;
+
+        var result = WindowsEventHistory.DeduplicateProcessHistory(new[] { identified, ambiguous }, 10);
+
+        Assert.Equal(2, result.Count);
+    }
+
+    [Fact]
+    public void HistoryDedup_MergesCorroboratedCrossSourceRecords()
+    {
+        var at = new DateTimeOffset(2026, 11, 24, 12, 0, 0, TimeSpan.Zero);
+        var sysmon = HistoricalLaunch("Sysmon 1", at);
+        var security = HistoricalLaunch("Security 4688", at.AddMilliseconds(50));
+        security.ProcessGuid = null; // Security 4688 does not provide Sysmon's process GUID.
+
+        var result = WindowsEventHistory.DeduplicateProcessHistory(new[] { sysmon, security }, 10);
+
+        Assert.Same(sysmon, Assert.Single(result));
+    }
+
     [Fact]
     public void History_ImportedLaunchKeepsItsCauseAndTimeSinceBoot()
     {
@@ -233,10 +320,16 @@ public class LogAndHistoryTests : IDisposable
             Source = "Security 4688",
             EventId = 4688,
             ProcessId = 37900,
+            ProcessGuid = "{PROCESS-A}",
             ParentProcessId = 37868,
             Image = @"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
             ParentImage = @"C:\Program Files\ASUS\asus_framework.exe",
-            CommandLine = "powershell.exe -c gwmi win32_process"
+            CommandLine = "powershell.exe -c gwmi win32_process",
+            SourceRecordId = 42,
+            User = @"CONTOSO\analyst",
+            UserSid = "S-1-5-21-1000",
+            LogonId = "0x12345",
+            SessionId = 2
         };
 
         var ev = HistoryImporter.ToEvent(launch, boot);
@@ -248,5 +341,12 @@ public class LogAndHistoryTests : IDisposable
         Assert.Equal(TimeSpan.FromMinutes(2), ev.TimeSinceBoot);
         Assert.StartsWith("Security 4688", ev.CaptureSource);
         Assert.Contains("Imported from the Windows event log", ev.Notes);
+        Assert.Equal(2, ev.SessionId);
+        Assert.Equal("Security 4688", ev.HistoricalSource);
+        Assert.Equal(42, ev.HistoricalRecordId);
+        Assert.Equal("{PROCESS-A}", ev.HistoricalProcessGuid);
+        Assert.Equal("S-1-5-21-1000", ev.HistoricalUserSid);
+        Assert.Equal("0x12345", ev.HistoricalLogonId);
+        Assert.True(HistoricalLaunchIdentity.IsSame(ev, launch));
     }
 }

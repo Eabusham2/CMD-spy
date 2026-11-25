@@ -23,18 +23,16 @@ public static class HistoryImporter
             image => !string.IsNullOrWhiteSpace(image) && stems.Contains(CmdSpyOptions.Stem(CommandLineTokenizer.FileNameOf(image))),
             max);
 
-        var known = alreadyKnown.Select(e => (e.ProcessId, e.TimestampUtc, e.CommandLine)).ToList();
+        var known = alreadyKnown.ToList();
         var currentBootUtc = SystemTimings.BootTimeLocal.ToUniversalTime();
         var result = new List<CmdEvent>();
         foreach (var h in launches)
         {
-            bool duplicate = known.Any(k =>
-                (k.TimestampUtc - h.TimeUtc).Duration() < TimeSpan.FromSeconds(3) &&
-                (h.ProcessId is { } pid ? k.ProcessId == pid : WindowsEventHistory.SameCommand(k.CommandLine, h.CommandLine)));
+            bool duplicate = known.Any(k => HistoricalLaunchIdentity.IsSame(k, h));
             if (duplicate) continue;
 
             var ev = ToEvent(h, currentBootUtc, history);
-            known.Add((ev.ProcessId, ev.TimestampUtc, ev.CommandLine));
+            known.Add(ev);
             result.Add(ev);
         }
         return result;
@@ -58,10 +56,16 @@ public static class HistoryImporter
             ImagePath = ProcessImageResolver.IsRooted(image) ? image : null,
             CommandLine = h.CommandLine,
             UserName = h.User,
+            SessionId = h.SessionId ?? -1,
             ParentProcessId = h.ParentProcessId ?? 0,
             ParentProcessName = string.IsNullOrWhiteSpace(h.ParentImage) ? null : CommandLineTokenizer.FileNameOf(h.ParentImage!),
             ParentImagePath = ProcessImageResolver.IsRooted(h.ParentImage) ? h.ParentImage : null,
             CaptureSource = $"{h.Source} (imported)",
+            HistoricalSource = h.Source,
+            HistoricalRecordId = h.SourceRecordId,
+            HistoricalProcessGuid = h.ProcessGuid,
+            HistoricalUserSid = h.UserSid,
+            HistoricalLogonId = h.LogonId,
             Notes = "Imported from the Windows event log — this launch happened before CMD-spy was capturing, " +
                     "so its exit, actions and connections were not observed." +
                     (bootUtc is null ? " The boot it belongs to could not be determined, so 'since boot' is not available." : "")

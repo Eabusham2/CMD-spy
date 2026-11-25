@@ -124,16 +124,19 @@ public sealed class WindowsEventHistory
                     {
                         TimeUtc = TimeOf(r),
                         Source = log == PowerShellCoreLog ? "PowerShell 7 4104" : "PowerShell 4104",
+                        SourceRecordId = RecordIdOf(r),
                         EventId = 4104,
                         ProcessId = processId,
                         Detail = CommandExplainer.Shorten(text, 2000),
                         CommandLine = v[1] as string,
+                        UserSid = UserSidOf(r),
                         RelatedTo = "script block run by this process"
                     };
                 }, newestFirst: false));
         }
 
-        // 400 (classic log) has no process ID, so match on time and command line.
+        // 400 has no process ID in its payload, so use the emitting process ID
+        // from System/Execution and match this focused lookup on command line.
         var start400 = Query(PowerShellClassicLog, $"*[System[(EventID=400) and {TimeWindow(from, startUtc + TimeSpan.FromSeconds(30))}]]", 5, r =>
         {
             var host = HostApplicationOf(r);
@@ -142,8 +145,11 @@ public sealed class WindowsEventHistory
             {
                 TimeUtc = TimeOf(r),
                 Source = "PowerShell 400",
+                SourceRecordId = RecordIdOf(r),
                 EventId = 400,
+                ProcessId = r.ProcessId is > 0 ? r.ProcessId : null,
                 CommandLine = host,
+                UserSid = UserSidOf(r),
                 Detail = "PowerShell engine started with this exact command line.",
                 RelatedTo = "this process"
             };
@@ -181,22 +187,32 @@ public sealed class WindowsEventHistory
             {
                 TimeUtc = TimeOf(r),
                 Source = "PowerShell 400",
+                SourceRecordId = RecordIdOf(r),
                 EventId = 400,
+                ProcessId = r.ProcessId is > 0 ? r.ProcessId : null,
                 CommandLine = host,
                 Image = tokens.Count > 0 ? tokens[0].Value : "powershell.exe",
+                UserSid = UserSidOf(r),
                 Detail = "PowerShell engine start"
             };
         }, newestFirst: false, scanLimit: 20_000));
 
-        // The same launch can appear in several logs: prefer Sysmon, then 4688, then 400.
-        var ordered = all.OrderBy(e => e.TimeUtc).ToList();
+        return DeduplicateProcessHistory(all, max);
+    }
+
+    /// <summary>
+    /// Collapses only source records that carry corroborating identity for the
+    /// same launch. Ambiguous records remain visible in the imported timeline.
+    /// </summary>
+    internal static List<HistoricalEvent> DeduplicateProcessHistory(IEnumerable<HistoricalEvent> events, int max)
+    {
+        // The same launch can appear in several logs: preserve the first record
+        // while retaining every record whose process or principal identity differs.
+        var ordered = events.OrderBy(e => e.TimeUtc).ToList();
         var result = new List<HistoricalEvent>();
         foreach (var e in ordered)
         {
-            bool duplicate = result.Any(x =>
-                Math.Abs((x.TimeUtc - e.TimeUtc).TotalSeconds) < 2 &&
-                (x.ProcessId is not null && x.ProcessId == e.ProcessId ||
-                 SameCommand(x.CommandLine, e.CommandLine)));
+            bool duplicate = result.Any(x => HistoricalLaunchIdentity.IsSame(x, e));
             if (!duplicate) result.Add(e);
         }
         return result.Take(max).ToList();
@@ -250,7 +266,8 @@ public sealed class WindowsEventHistory
     // ------------------------------------------------------------ parsing --
 
     private static readonly EventLogPropertySelector SysmonSelector = Selector(
-        "ProcessId", "Image", "CommandLine", "ParentProcessId", "ParentImage", "ParentCommandLine", "User", "Hashes");
+        "ProcessId", "Image", "CommandLine", "ParentProcessId", "ParentImage", "ParentCommandLine", "User", "Hashes",
+        "ProcessGuid", "LogonId", "TerminalSessionId");
 
     private static HistoricalEvent? ParseSysmon(EventLogRecord record)
     {
@@ -261,38 +278,48 @@ public sealed class WindowsEventHistory
         {
             TimeUtc = TimeOf(record),
             Source = "Sysmon 1",
+            SourceRecordId = RecordIdOf(record),
             EventId = 1,
             ProcessId = pid,
+            ProcessGuid = IdentityOf(v[8]),
             Image = v[1] as string,
             CommandLine = v[2] as string,
             ParentProcessId = ToPid(v[3]),
             ParentImage = v[4] as string,
             User = v[6] as string,
+            LogonId = IdentityOf(v[9]),
+            SessionId = ToPid(v[10]),
             Detail = v[7] is string hashes && hashes.Length > 0 ? $"Hashes: {hashes}" : (v[5] is string pc ? $"Parent command line: {pc}" : null)
         };
     }
 
     private static readonly EventLogPropertySelector SecuritySelector = Selector(
-        "NewProcessId", "NewProcessName", "CommandLine", "ProcessId", "ParentProcessName", "SubjectUserName", "SubjectDomainName");
+        "NewProcessId", "NewProcessName", "CommandLine", "ProcessId", "ParentProcessName", "SubjectUserName", "SubjectDomainName",
+        "SubjectUserSid", "SubjectLogonId", "TargetUserName", "TargetDomainName", "TargetUserSid", "TargetLogonId");
 
     private static HistoricalEvent? ParseSecurity4688(EventLogRecord record)
     {
         var v = Values(record, SecuritySelector);
         var pid = ToPid(v[0]);
         if (pid is null) return null;
-        var user = v[5] as string;
-        if (v[6] is string domain && domain.Length > 0 && user is not null) user = $"{domain}\\{user}";
+        var subjectUser = QualifiedUser(IdentityOf(v[5]), IdentityOf(v[6]));
+        var targetUser = QualifiedUser(IdentityOf(v[9]), IdentityOf(v[10]));
+        var targetSid = IdentityOf(v[11]);
+        bool useTarget = targetUser is not null || targetSid is not null;
         return new HistoricalEvent
         {
             TimeUtc = TimeOf(record),
             Source = "Security 4688",
+            SourceRecordId = RecordIdOf(record),
             EventId = 4688,
             ProcessId = pid,
             Image = v[1] as string,
             CommandLine = v[2] is string c && c.Length > 0 ? c : null,
             ParentProcessId = ToPid(v[3]),
             ParentImage = v[4] as string,
-            User = user
+            User = useTarget ? targetUser : subjectUser,
+            UserSid = useTarget ? targetSid : IdentityOf(v[7]),
+            LogonId = IdentityOf(useTarget ? v[12] : v[8])
         };
     }
 
@@ -419,6 +446,27 @@ public sealed class WindowsEventHistory
 
     private static DateTimeOffset TimeOf(EventRecord record) =>
         record.TimeCreated is { } t ? new DateTimeOffset(t.ToUniversalTime(), TimeSpan.Zero) : DateTimeOffset.UtcNow;
+
+    private static long? RecordIdOf(EventRecord record)
+    {
+        try { return record.RecordId; }
+        catch { return null; }
+    }
+
+    private static string? UserSidOf(EventRecord record)
+    {
+        try { return record.UserId?.Value; }
+        catch { return null; }
+    }
+
+    private static string? IdentityOf(object? value)
+    {
+        var text = value?.ToString()?.Trim();
+        return string.IsNullOrEmpty(text) || text == "-" ? null : text;
+    }
+
+    private static string? QualifiedUser(string? user, string? domain) =>
+        user is null ? null : domain is null ? user : $"{domain}\\{user}";
 
     private static string TimeWindow(DateTimeOffset fromUtc, DateTimeOffset toUtc) =>
         $"TimeCreated[@SystemTime>='{fromUtc.UtcDateTime:yyyy-MM-ddTHH:mm:ss.fffZ}' and @SystemTime<='{toUtc.UtcDateTime:yyyy-MM-ddTHH:mm:ss.fffZ}']";

@@ -60,6 +60,13 @@ public sealed class CmdEvent
     public string CaptureSource { get; set; } = "";
     public string? Notes { get; set; }
 
+    /// <summary>Identity retained for launches imported from a Windows event log.</summary>
+    public string? HistoricalSource { get; set; }
+    public long? HistoricalRecordId { get; set; }
+    public string? HistoricalProcessGuid { get; set; }
+    public string? HistoricalUserSid { get; set; }
+    public string? HistoricalLogonId { get; set; }
+
     // ---- Investigation ----------------------------------------------------
     /// <summary>
     /// Deep analysis attached shortly after capture: launch chain, referenced
