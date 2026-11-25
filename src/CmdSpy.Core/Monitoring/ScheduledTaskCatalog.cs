@@ -252,7 +252,7 @@ public sealed class ScheduledTaskCatalog
         if (processFile.Length == 0) return results;
         var normalizedCommand = NormalizeSpace(commandLine);
 
-        foreach (var task in tasks)
+        foreach (var task in tasks.Where(t => t.Enabled))
         {
             foreach (var action in task.Actions.Where(a => a.Kind == "Exec" && !string.IsNullOrWhiteSpace(a.Command)))
             {

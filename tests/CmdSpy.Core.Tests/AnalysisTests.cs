@@ -292,6 +292,49 @@ public class AnalysisTests
     }
 
     [Fact]
+    public void Risk_HeuristicTaskDoesNotLowerTheVerdict()
+    {
+        var risk = RiskAssessor.Assess(new RiskInput
+        {
+            Findings = Detect(AsusQuery),
+            Explanation = CommandExplainer.Explain(CommandParser.Parse(AsusQuery)),
+            ProcessName = "powershell.exe",
+            Signatures = new[] { Signed("this process", "Microsoft Windows") },
+            Task = new ScheduledTaskMatch
+            {
+                TaskPath = @"\Microsoft\Windows\Lookalike",
+                Confidence = TaskConfidence.Likely,
+                Author = "Untrusted User"
+            }
+        });
+
+        Assert.Equal(RiskLevel.Unknown, risk.Level);
+        Assert.DoesNotContain(risk.LoweringFactors, factor => factor.Contains("scheduled task"));
+        Assert.Contains(risk.Unknowns, unknown => unknown.Contains("launched it could not be identified"));
+    }
+
+    [Fact]
+    public void Risk_ConfirmedTaskStillSupportsVerifiedLauncher()
+    {
+        var risk = RiskAssessor.Assess(new RiskInput
+        {
+            Findings = Detect(AsusQuery),
+            Explanation = CommandExplainer.Explain(CommandParser.Parse(AsusQuery)),
+            ProcessName = "powershell.exe",
+            Signatures = new[] { Signed("this process", "Microsoft Windows") },
+            Task = new ScheduledTaskMatch
+            {
+                TaskPath = @"\Microsoft\Windows\Maintenance",
+                Confidence = TaskConfidence.Confirmed,
+                Author = "Microsoft Corporation"
+            }
+        });
+
+        Assert.Equal(RiskLevel.Low, risk.Level);
+        Assert.Contains(risk.LoweringFactors, factor => factor.Contains("scheduled task"));
+    }
+
+    [Fact]
     public void Risk_OneStrongIndicatorIsHighRisk()
     {
         const string command = "cmd.exe /c vssadmin delete shadows /all /quiet & bcdedit /set {default} recoveryenabled no";
