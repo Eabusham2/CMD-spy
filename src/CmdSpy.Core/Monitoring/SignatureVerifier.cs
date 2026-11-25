@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -15,19 +14,17 @@ namespace CmdSpy.Core.Monitoring;
 /// using Windows' own Authenticode verification (WinVerifyTrust) for both
 /// embedded signatures and Windows catalog signatures — most of System32,
 /// including cmd.exe, is catalog-signed. Also records SHA-256, size and version
-/// info. Results are cached per file (path + size + timestamp).
+/// info. Each observation is verified afresh so a mutable path cannot inherit
+/// trust information from bytes that were previously stored there.
 /// </summary>
 public sealed class SignatureVerifier
 {
-    private readonly ConcurrentDictionary<string, (long Size, DateTime Written, SignatureInfo Info)> _cache =
-        new(StringComparer.OrdinalIgnoreCase);
-
     public bool ComputeHashes { get; init; } = true;
 
     /// <summary>Verifies <paramref name="path"/>; the result is a copy carrying the given role/PID.</summary>
     public SignatureInfo Verify(string path, string role, int? processId = null)
     {
-        var info = VerifyCached(path);
+        var info = VerifyCurrent(path);
         var copy = Clone(info);
         copy.Role = role;
         copy.ProcessId = processId;
@@ -50,29 +47,20 @@ public sealed class SignatureVerifier
         }
     }
 
-    private SignatureInfo VerifyCached(string path)
+    private SignatureInfo VerifyCurrent(string path)
     {
         long size = -1;
-        DateTime written = default;
         try
         {
             var fi = new FileInfo(path);
             if (fi.Exists)
-            {
                 size = fi.Length;
-                written = fi.LastWriteTimeUtc;
-            }
         }
         catch
         {
         }
 
-        if (_cache.TryGetValue(path, out var cached) && cached.Size == size && cached.Written == written)
-            return cached.Info;
-
-        var info = VerifyUncached(path, size);
-        _cache[path] = (size, written, info);
-        return info;
+        return VerifyUncached(path, size);
     }
 
     private SignatureInfo VerifyUncached(string path, long size)
