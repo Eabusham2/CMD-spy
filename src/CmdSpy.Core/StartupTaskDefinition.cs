@@ -71,7 +71,8 @@ public static class StartupTaskDefinition
             E("Actions", new XAttribute("Context", "Author"),
                 E("Exec", E("Command", executablePath), E("Arguments", Arguments))));
 
-        // Task Scheduler consumes the in-memory XML as a UTF-16 COM string.
+        // The COM path consumes a UTF-16 string; the compatibility path writes
+        // this same definition as a protected UTF-16 XML file for schtasks.
         return "<?xml version=\"1.0\" encoding=\"UTF-16\"?>" + Environment.NewLine + task;
     }
 }

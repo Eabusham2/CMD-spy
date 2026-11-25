@@ -63,7 +63,8 @@ internal static class StartupManager
 
         try
         {
-            RegisterTask(StartupTaskDefinition.BuildXml(exe, user), user);
+            if (RegisterTask(StartupTaskDefinition.BuildXml(exe, user), user))
+                log.Add("✓ The logon task was registered using the Windows schtasks compatibility path.");
         }
         catch (Exception ex)
         {
@@ -75,12 +76,25 @@ internal static class StartupManager
         return log;
     }
 
+    private static bool RegisterTask(string taskXml, string user, Action<string, string>? registerWithCom = null) =>
+        StartupTaskRegistration.Register(taskXml, user, registerWithCom ?? RegisterTaskWithCom, RegisterTaskWithSchtasks);
+
+    private static void RegisterTaskWithSchtasks(string taskXml, string user)
+    {
+        // The same XML supplies the interactive user, triggers and privileges;
+        // do not override its principal with different schtasks switches.
+        using var file = StartupTaskXmlFile.Create(taskXml);
+        var (code, output) = Schtasks($"/Create /TN \"{StartupTaskDefinition.TaskName}\" /XML \"{file.FilePath}\" /F");
+        if (code != 0)
+            throw new InvalidOperationException($"schtasks exited with code {code}: {output.Trim()}");
+    }
+
     /// <summary>
     /// Registers the definition directly with the Task Scheduler service. Keeping
     /// the XML in memory prevents another process from replacing it between
     /// generation and the privileged service consuming it.
     /// </summary>
-    private static void RegisterTask(string taskXml, string user)
+    private static void RegisterTaskWithCom(string taskXml, string user)
     {
         object? service = null;
         object? rootFolder = null;
@@ -133,8 +147,15 @@ internal static class StartupManager
 
     private static void ReleaseComObject(object? value)
     {
-        if (value is not null && Marshal.IsComObject(value))
-            Marshal.FinalReleaseComObject(value);
+        try
+        {
+            if (value is not null && Marshal.IsComObject(value))
+                Marshal.FinalReleaseComObject(value);
+        }
+        // A cleanup error after registration is not a COM registration failure
+        // and must not cause the successful task to be registered again.
+        catch (InvalidComObjectException) { }
+        catch (COMException) { }
     }
 
     public static List<string> DisableLogonTask()
@@ -179,14 +200,45 @@ internal static class StartupManager
                 RedirectStandardOutput = true,
                 RedirectStandardError = true
             };
-            using var p = Process.Start(psi)!;
-            var output = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
-            p.WaitForExit(30_000);
-            return (p.ExitCode, output);
+            using var p = Process.Start(psi)
+                ?? throw new InvalidOperationException("Windows schtasks could not be started.");
+            try
+            {
+                // Drain both pipes together so a full stderr pipe cannot block
+                // stdout and bypass the registration timeout.
+                var stdout = p.StandardOutput.ReadToEndAsync();
+                var stderr = p.StandardError.ReadToEndAsync();
+                var exited = p.WaitForExit(30_000);
+                if (!exited) StopAndWait(p);
+                var output = stdout.GetAwaiter().GetResult() + stderr.GetAwaiter().GetResult();
+                return exited
+                    ? (p.ExitCode, output)
+                    : (-1, "Windows schtasks timed out after 30 seconds. " + output);
+            }
+            finally
+            {
+                // The caller keeps the protected XML read handle alive until
+                // this returns. Never release it while schtasks is still live.
+                StopAndWait(p);
+            }
         }
         catch (Exception ex)
         {
             return (-1, ex.Message);
+        }
+    }
+
+    private static void StopAndWait(Process process)
+    {
+        if (process.HasExited) return;
+        try
+        {
+            try { process.Kill(entireProcessTree: true); }
+            catch (InvalidOperationException) when (process.HasExited) { }
+        }
+        finally
+        {
+            process.WaitForExit();
         }
     }
 }
