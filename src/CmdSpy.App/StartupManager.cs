@@ -139,7 +139,8 @@ internal static class StartupManager
         {
             return root.GetFolder(TaskFolderName);
         }
-        catch (COMException ex) when (ex.HResult == HResultFileNotFound || ex.HResult == HResultPathNotFound)
+        // COM interop maps missing-file/path HRESULTs to managed IO exceptions.
+        catch (Exception ex) when (ex.HResult == HResultFileNotFound || ex.HResult == HResultPathNotFound)
         {
             return root.CreateFolder(TaskFolderName, null);
         }

@@ -150,13 +150,27 @@ internal static class Smoke
             ?? throw new InvalidOperationException("This build has no StartupManager.");
         var register = startupManager.GetMethod("RegisterTask", BindingFlags.NonPublic | BindingFlags.Static)
             ?? throw new InvalidOperationException("This build has no task registration entry point.");
+        var registerCom = startupManager.GetMethod("RegisterTaskWithCom", BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new InvalidOperationException("This build has no direct COM task registration entry point.");
         var mode = forceCompatibility ? "schtasks fallback after COM failure" : "COM";
         Log($"Testing logon task registration through {mode}.");
         try
         {
-            Action<string, string>? comRegistration = forceCompatibility
-                ? (_, _) => throw new COMException("Intentional COM failure for the compatibility smoke test.")
-                : null;
+            Action<string, string> comRegistration = (definitionXml, identityName) =>
+            {
+                if (forceCompatibility)
+                    throw new COMException("Intentional COM failure for the compatibility smoke test.");
+                try
+                {
+                    registerCom.Invoke(null, new object[] { definitionXml, identityName });
+                }
+                catch (TargetInvocationException ex) when (ex.InnerException is not null)
+                {
+                    var cause = ex.InnerException!;
+                    Log($"Direct COM registration failed ({cause.GetType().FullName}, HRESULT 0x{cause.HResult:X8}): {cause}");
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(cause).Throw();
+                }
+            };
             var usedCompatibility = (bool)register.Invoke(null, new object?[] { xml, user, comRegistration })!;
             Check($"Logon task registers through {mode}", usedCompatibility == forceCompatibility,
                 usedCompatibility ? "schtasks compatibility path" : "direct COM path");
