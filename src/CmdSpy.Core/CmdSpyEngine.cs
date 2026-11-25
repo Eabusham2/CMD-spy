@@ -255,7 +255,12 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
     /// <paramref name="expectedStartUtc"/> — i.e. the PID wasn't recycled.
     /// </summary>
     private bool IsSameIncarnation(int pid, DateTimeOffset expectedStartUtc, DateTimeOffset asOfUtc)
-        => _processes.IsIncarnationAliveAt(pid, expectedStartUtc, asOfUtc);
+    {
+        if (_processes.IsIncarnationAliveAt(pid, expectedStartUtc, asOfUtc)) return true;
+        var only = _processes.TryGetUnambiguousIncarnation(pid, expectedStartUtc);
+        return only is not null && asOfUtc >= expectedStartUtc - ProcessCache.Skew &&
+               (only.ExitTimeUtc is null || asOfUtc <= only.ExitTimeUtc.Value + ProcessCache.Skew);
+    }
 
     private void CaptureCmdPopup(ProcessStartedEventArgs e)
     {
@@ -555,7 +560,6 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
     internal void OnConnectionObserved(int pid, NetworkConnectionInfo connection)
     {
         if (!_options.CaptureNetwork || !_options.CaptureNetworkEvents) return;
-        if (connection.ObservedAtUtc is null) return; // A PID alone cannot identify an incarnation.
 
         var targets = new List<CmdEvent>(2);
         if (_active.TryGetValue(pid, out var own) && Within(connection, pid, own.TimestampUtc))
@@ -597,16 +601,27 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
         EventUpdated?.Invoke(this, target);
     }
 
-    /// <summary>True if the timestamp belongs to this exact PID incarnation's lifetime.</summary>
+    /// <summary>
+    /// Uses exact incarnation evidence first, retaining the original untimed
+    /// and clock-skew paths only when there is no competing PID incarnation.
+    /// </summary>
     private bool Within(
         NetworkConnectionInfo connection,
         int pid,
         DateTimeOffset startUtc,
         DateTimeOffset? exitUtc = null)
     {
-        if (connection.ObservedAtUtc is not { } at || at < startUtc || (exitUtc is { } exit && at > exit))
-            return false;
-        return _processes.IsIncarnationAliveAt(pid, startUtc, at);
+        if (connection.ObservedAtUtc is { } at && at >= startUtc &&
+            (exitUtc is null || at <= exitUtc.Value) &&
+            _processes.IsIncarnationAliveAt(pid, startUtc, at))
+            return true;
+
+        var only = _processes.TryGetUnambiguousIncarnation(pid, startUtc);
+        if (only is null) return false;
+        if (connection.ObservedAtUtc is not { } observed) return true;
+        var end = exitUtc ?? only.ExitTimeUtc;
+        return observed >= startUtc - ProcessCache.Skew &&
+               (end is null || observed <= end.Value + ProcessCache.Skew);
     }
 
     private void PruneRecentlyExited(DateTimeOffset nowUtc)

@@ -265,6 +265,77 @@ public class EngineTests : IDisposable
     }
 
     [Fact]
+    public void UntimedConnectionsRetainBufferedLiveDescendantAndLateCapture()
+    {
+        using var engine = NewEngine(network: true);
+        CmdEvent? captured = null;
+        engine.EventCaptured += (_, ev) => captured = ev;
+        var t = DateTimeOffset.UtcNow;
+        NetworkConnectionInfo Connection(int pid, int port) => new()
+        {
+            Protocol = "TCP", LocalPort = port, RemoteAddress = "198.51.100.1",
+            RemotePort = 443, OwningPid = pid, Source = "compatibility"
+        };
+
+        engine.OnConnectionObserved(Cmd, Connection(Cmd, 50200));
+        _watcher.Started(Cmd, 0, "cmd.exe", "cmd.exe /c tools", t);
+        engine.OnConnectionObserved(Cmd, Connection(Cmd, 50201));
+        _watcher.Started(Ping, Cmd, "tool.exe", "tool.exe", t.AddMilliseconds(1));
+        engine.OnConnectionObserved(Ping, Connection(Ping, 50202));
+        _watcher.Stopped(Ping, t.AddMilliseconds(10));
+        _watcher.Stopped(Cmd, t.AddMilliseconds(20));
+        engine.OnConnectionObserved(Ping, Connection(Ping, 50203));
+        engine.OnConnectionObserved(Cmd, Connection(Cmd, 50204));
+
+        Assert.NotNull(captured);
+        Assert.Equal(new[] { 50200, 50201, 50202, 50203, 50204 },
+            captured!.NetworkConnections.Select(c => c.LocalPort).OrderBy(p => p));
+        var saved = Assert.Single(engine.Store.ReadToday());
+        Assert.Equal(5, saved.NetworkConnections.Count);
+    }
+
+    [Fact]
+    public void UntimedConnectionDoesNotGuessBetweenReusedIncarnations()
+    {
+        using var engine = NewEngine(network: true);
+        var captured = new List<CmdEvent>();
+        engine.EventCaptured += (_, ev) => captured.Add(ev);
+        var t = DateTimeOffset.UtcNow;
+        _watcher.Started(Cmd, 0, "cmd.exe", "cmd.exe /c first", t);
+        _watcher.Stopped(Cmd, t.AddMilliseconds(10));
+        _watcher.Started(Cmd, 0, "cmd.exe", "cmd.exe /c second", t.AddMilliseconds(20));
+        engine.OnConnectionObserved(Cmd, new NetworkConnectionInfo
+        {
+            Protocol = "TCP", LocalPort = 50210, RemoteAddress = "198.51.100.1",
+            RemotePort = 443, OwningPid = Cmd, Source = "compatibility"
+        });
+        Assert.All(captured, ev => Assert.DoesNotContain(ev.NetworkConnections, c => c.LocalPort == 50210));
+    }
+
+    [Fact]
+    public void NetworkClockSkewIsRetainedOnlyForAnUnambiguousPid()
+    {
+        using var engine = NewEngine(network: true);
+        var captured = new List<CmdEvent>();
+        engine.EventCaptured += (_, ev) => captured.Add(ev);
+        var t = DateTimeOffset.UtcNow;
+        NetworkConnectionInfo Connection(int port, DateTimeOffset observed) => new()
+        {
+            Protocol = "TCP", LocalPort = port, RemoteAddress = "198.51.100.1",
+            RemotePort = 443, OwningPid = Cmd, Source = "ETW", ObservedAtUtc = observed
+        };
+        _watcher.Started(Cmd, 0, "cmd.exe", "cmd.exe /c first", t);
+        engine.OnConnectionObserved(Cmd, Connection(50220, t.AddMilliseconds(-100)));
+        _watcher.Stopped(Cmd, t.AddSeconds(1));
+        engine.OnConnectionObserved(Cmd, Connection(50221, t.AddMilliseconds(1100)));
+        _watcher.Started(Cmd, 0, "cmd.exe", "cmd.exe /c second", t.AddMilliseconds(1200));
+        engine.OnConnectionObserved(Cmd, Connection(50222, t.AddMilliseconds(1150)));
+
+        Assert.Equal(new[] { 50220, 50221 }, captured[0].NetworkConnections.Select(c => c.LocalPort));
+        Assert.Empty(captured[1].NetworkConnections);
+    }
+
+    [Fact]
     public void FinalRecordWaitsForTheInvestigationAndIncludesIt()
     {
         using var engine = NewEngine(investigate: true);

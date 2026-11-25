@@ -197,6 +197,21 @@ public sealed class ProcessCache
     }
 
     /// <summary>
+    /// Returns the sole known incarnation for compatibility with sources that
+    /// omit a timestamp or have small clock skew. Never guesses after PID reuse.
+    /// </summary>
+    internal ProcessRecord? TryGetUnambiguousIncarnation(int processId, DateTimeOffset startTimeUtc)
+    {
+        lock (_gate)
+        {
+            if (!_byPid.TryGetValue(processId, out var list) || list.Count != 1 ||
+                list[0].StartTimeUtc != startTimeUtc)
+                return null;
+            return list[0].Clone();
+        }
+    }
+
+    /// <summary>
     /// The incarnation of <paramref name="processId"/> that existed at
     /// <paramref name="asOfUtc"/> (the most recent one if no time is given).
     /// With <paramref name="requireAlive"/>, returns null if that incarnation had
