@@ -163,6 +163,9 @@ internal sealed class AppSettings
     /// <summary>Show a notification when a popup is analysed as High risk or Suspicious.</summary>
     public bool AlertOnSuspicious { get; set; } = true;
 
+    /// <summary>Opt in to fresh signature checks for analyses in the GUI.</summary>
+    public bool AlwaysRecheckFileSignatures { get; set; }
+
     public bool TrayHintShown { get; set; }
 
     private static string FilePath => Path.Combine(

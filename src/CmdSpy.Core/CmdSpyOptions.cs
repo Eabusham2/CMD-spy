@@ -46,6 +46,12 @@ public sealed class CmdSpyOptions
     /// <summary>Check Authenticode signatures and publishers of the executables involved.</summary>
     public bool VerifySignatures { get; set; } = true;
 
+    /// <summary>
+    /// Recheck signatures and file metadata on every analysis instead of using
+    /// the size/timestamp cache. Off by default because it adds disk and CPU work.
+    /// </summary>
+    public bool AlwaysRecheckFileSignatures { get; set; }
+
     /// <summary>Compute SHA-256 hashes of the executables involved.</summary>
     public bool ComputeFileHashes { get; set; } = true;
 

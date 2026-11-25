@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -14,17 +15,42 @@ namespace CmdSpy.Core.Monitoring;
 /// using Windows' own Authenticode verification (WinVerifyTrust) for both
 /// embedded signatures and Windows catalog signatures — most of System32,
 /// including cmd.exe, is catalog-signed. Also records SHA-256, size and version
-/// info. Each observation is verified afresh so a mutable path cannot inherit
-/// trust information from bytes that were previously stored there.
+/// info. Results are cached per file (path + size + timestamp) by default.
+/// Enable <see cref="AlwaysRecheck"/> to inspect the file afresh on every call.
 /// </summary>
 public sealed class SignatureVerifier
 {
+    private readonly object _cacheLock = new();
+    private readonly Dictionary<string, (long Size, DateTime Written, SignatureInfo Info)> _cache =
+        new(StringComparer.OrdinalIgnoreCase);
+    private bool _alwaysRecheck;
+    private long _cacheGeneration;
+
     public bool ComputeHashes { get; init; } = true;
+
+    /// <summary>
+    /// Bypass the metadata cache. Off by default to avoid repeatedly reading
+    /// and verifying unchanged executables. Changing modes discards old results.
+    /// </summary>
+    public bool AlwaysRecheck
+    {
+        get { lock (_cacheLock) return _alwaysRecheck; }
+        set
+        {
+            lock (_cacheLock)
+            {
+                if (_alwaysRecheck == value) return;
+                _alwaysRecheck = value;
+                _cache.Clear();
+                _cacheGeneration++;
+            }
+        }
+    }
 
     /// <summary>Verifies <paramref name="path"/>; the result is a copy carrying the given role/PID.</summary>
     public SignatureInfo Verify(string path, string role, int? processId = null)
     {
-        var info = VerifyCurrent(path);
+        var info = VerifyCached(path);
         var copy = Clone(info);
         copy.Role = role;
         copy.ProcessId = processId;
@@ -47,20 +73,44 @@ public sealed class SignatureVerifier
         }
     }
 
-    private SignatureInfo VerifyCurrent(string path)
+    private SignatureInfo VerifyCached(string path)
     {
         long size = -1;
+        DateTime written = default;
         try
         {
             var fi = new FileInfo(path);
             if (fi.Exists)
+            {
                 size = fi.Length;
+                written = fi.LastWriteTimeUtc;
+            }
         }
         catch
         {
         }
 
-        return VerifyUncached(path, size);
+        long generation;
+        bool alwaysRecheck;
+        lock (_cacheLock)
+        {
+            generation = _cacheGeneration;
+            alwaysRecheck = _alwaysRecheck;
+            if (!alwaysRecheck && _cache.TryGetValue(path, out var cached) &&
+                cached.Size == size && cached.Written == written)
+                return cached.Info;
+        }
+
+        // File I/O and native trust verification must not block the UI toggle.
+        var info = VerifyUncached(path, size);
+        lock (_cacheLock)
+        {
+            // A check that began before a mode change must not repopulate the
+            // cleared cache, even if the user has already switched back.
+            if (!alwaysRecheck && generation == _cacheGeneration)
+                _cache[path] = (size, written, info);
+        }
+        return info;
     }
 
     private SignatureInfo VerifyUncached(string path, long size)

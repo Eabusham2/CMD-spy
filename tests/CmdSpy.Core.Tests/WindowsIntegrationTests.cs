@@ -216,13 +216,13 @@ public class WindowsIntegrationTests : IDisposable
     }
 
     [WindowsFact]
-    public void MetadataPreservingReplacementIsRehashed()
+    public void MetadataPreservingReplacementIsRehashedWhenFreshChecksAreEnabled()
     {
         Directory.CreateDirectory(_dir.Path);
         var path = Path.Combine(_dir.Path, "replace.bin");
         File.WriteAllBytes(path, new byte[] { 1, 2, 3, 4 });
         var originalWriteTime = File.GetLastWriteTimeUtc(path);
-        var verifier = new SignatureVerifier();
+        var verifier = new SignatureVerifier { AlwaysRecheck = true };
 
         var original = verifier.Verify(path, "original");
         File.WriteAllBytes(path, new byte[] { 5, 6, 7, 8 });

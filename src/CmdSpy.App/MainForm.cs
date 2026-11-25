@@ -62,7 +62,10 @@ public sealed partial class MainForm : Form
     public MainForm(bool startInTray, SingleInstance? instance)
     {
         _startInTray = startInTray;
-        _engine = new CmdSpyEngine();
+        _engine = new CmdSpyEngine(new CmdSpyOptions
+        {
+            AlwaysRecheckFileSignatures = _settings.AlwaysRecheckFileSignatures
+        });
         _engine.EventCaptured += (_, ev) => UiInvoke(() => OnCaptured(ev));
         _engine.EventUpdated += (_, ev) => UiInvoke(() => OnUpdated(ev));
         _engine.Status += (_, msg) => UiInvoke(() => OnStatus(msg));
