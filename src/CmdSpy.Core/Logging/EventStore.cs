@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -28,6 +29,13 @@ public sealed class EventStore
 {
     private readonly string _directory;
     private readonly object _fileLock = new();
+    private readonly long _maxFileBytes;
+    private readonly long _maxDirectoryBytes;
+    private readonly int _maxRecordBytes;
+    private readonly long _minFreeBytes;
+    private readonly int _retentionDays;
+    private readonly HashSet<string> _reportedRejections = new(StringComparer.OrdinalIgnoreCase);
+    private DateTime _lastMaintenanceDate;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -36,13 +44,24 @@ public sealed class EventStore
         Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
     };
 
-    public EventStore(string directory)
+    public EventStore(string directory, long maxFileBytes = 64L * 1024 * 1024,
+        int retentionDays = 14, long minFreeBytes = 512L * 1024 * 1024,
+        long maxDirectoryBytes = 512L * 1024 * 1024, int maxRecordBytes = 1024 * 1024)
     {
         _directory = directory;
+        _maxFileBytes = Math.Max(1, maxFileBytes);
+        _maxDirectoryBytes = Math.Max(_maxFileBytes, maxDirectoryBytes);
+        _maxRecordBytes = Math.Max(1, maxRecordBytes);
+        _minFreeBytes = Math.Max(0, minFreeBytes);
+        _retentionDays = Math.Max(1, retentionDays);
         System.IO.Directory.CreateDirectory(_directory);
+        MaintainLogs();
     }
 
     public string Directory => _directory;
+
+    /// <summary>Raised once per limit and day when a complete log record is rejected.</summary>
+    public event Action<string>? WriteRejected;
 
     public string CurrentJsonlPath =>
         Path.Combine(_directory, $"cmdspy-{DateTime.Now:yyyyMMdd}.jsonl");
@@ -51,7 +70,7 @@ public sealed class EventStore
         Path.Combine(_directory, $"cmdspy-{DateTime.Now:yyyyMMdd}.log");
 
     /// <summary>Writes the initial creation record for a freshly captured event.</summary>
-    public void Append(CmdEvent ev)
+    public bool Append(CmdEvent ev)
     {
         // Serialize/format under lock(ev) — a watcher thread may be attaching a
         // child process to this same event concurrently.
@@ -63,8 +82,10 @@ public sealed class EventStore
         }
         lock (_fileLock)
         {
-            AppendShared(CurrentJsonlPath, json + Environment.NewLine);
-            AppendShared(CurrentLogPath, text + Environment.NewLine);
+            MaintainLogs();
+            bool jsonWritten = AppendShared(CurrentJsonlPath, json + Environment.NewLine);
+            bool textWritten = AppendShared(CurrentLogPath, text + Environment.NewLine);
+            return jsonWritten && textWritten;
         }
     }
 
@@ -76,7 +97,7 @@ public sealed class EventStore
     /// than losing the actions/endpoints captured after creation. On exit we also
     /// append a finalized block to the human-readable log.
     /// </summary>
-    public void AppendUpdate(CmdEvent ev, string reason)
+    public bool AppendUpdate(CmdEvent ev, string reason)
     {
         string json;
         string? finalText = null;
@@ -90,9 +111,11 @@ public sealed class EventStore
         }
         lock (_fileLock)
         {
-            AppendShared(CurrentJsonlPath, json + Environment.NewLine);
+            MaintainLogs();
+            bool written = AppendShared(CurrentJsonlPath, json + Environment.NewLine);
             if (finalText is not null)
-                AppendShared(CurrentLogPath, finalText + Environment.NewLine);
+                written &= AppendShared(CurrentLogPath, finalText + Environment.NewLine);
+            return written;
         }
     }
 
@@ -101,17 +124,117 @@ public sealed class EventStore
     /// file — e.g. the GUI following the service's log. A new file gets a BOM,
     /// as before, so editors detect the encoding.
     /// </summary>
-    private static void AppendShared(string path, string text)
+    private bool AppendShared(string path, string text)
     {
+        var bytes = Encoding.UTF8.GetBytes(text);
+        if (bytes.Length > _maxRecordBytes)
+        {
+            ReportRejected(path, $"record quota of {_maxRecordBytes} bytes reached");
+            return false;
+        }
+        if (!HasDiskReserve(path, bytes.LongLength))
+        {
+            ReportRejected(path, "free-space reserve reached");
+            return false;
+        }
+
         using var fs = new FileStream(path, FileMode.Append, FileAccess.Write,
             FileShare.ReadWrite | FileShare.Delete);
-        if (fs.Length == 0)
+        var bom = fs.Length == 0 ? Encoding.UTF8.GetPreamble() : Array.Empty<byte>();
+        long recordBytes = bytes.LongLength + bom.LongLength;
+        if (recordBytes > _maxFileBytes || fs.Length > _maxFileBytes - recordBytes)
         {
-            var bom = Encoding.UTF8.GetPreamble();
-            fs.Write(bom, 0, bom.Length);
+            ReportRejected(path, $"daily file quota of {_maxFileBytes} bytes reached");
+            return false;
         }
-        var bytes = Encoding.UTF8.GetBytes(text);
+        if (recordBytes > _maxDirectoryBytes ||
+            LogDirectoryBytes() > _maxDirectoryBytes - recordBytes)
+        {
+            ReportRejected(path, $"log directory quota of {_maxDirectoryBytes} bytes reached");
+            return false;
+        }
+
+        if (bom.Length > 0) fs.Write(bom, 0, bom.Length);
         fs.Write(bytes, 0, bytes.Length);
+        return true;
+    }
+
+    private bool HasDiskReserve(string path, long writeBytes)
+    {
+        try
+        {
+            var root = Path.GetPathRoot(Path.GetFullPath(path));
+            if (string.IsNullOrEmpty(root)) return false;
+            long available = new DriveInfo(root).AvailableFreeSpace;
+            return available >= _minFreeBytes && writeBytes <= available - _minFreeBytes;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private long LogDirectoryBytes()
+    {
+        long total = 0;
+        foreach (var path in DatedLogPaths())
+        {
+            try
+            {
+                long length = new FileInfo(path).Length;
+                if (length > long.MaxValue - total) return long.MaxValue;
+                total += length;
+            }
+            catch
+            {
+                return long.MaxValue;
+            }
+        }
+        return total;
+    }
+
+    private void MaintainLogs()
+    {
+        var today = DateTime.Today;
+        if (_lastMaintenanceDate == today) return;
+        _lastMaintenanceDate = today;
+        _reportedRejections.Clear();
+        var cutoff = today.AddDays(1 - _retentionDays);
+        foreach (var path in DatedLogPaths())
+        {
+            if (!TryGetLogDate(path, out var date) || date >= cutoff) continue;
+            try { File.Delete(path); } catch { /* the directory quota still prevents further growth */ }
+        }
+    }
+
+    private IEnumerable<string> DatedLogPaths()
+    {
+        try
+        {
+            return System.IO.Directory.EnumerateFiles(_directory, "cmdspy-*.*")
+                .Where(path => TryGetLogDate(path, out _)).ToList();
+        }
+        catch { return Array.Empty<string>(); }
+    }
+
+    private static bool TryGetLogDate(string path, out DateTime date)
+    {
+        date = default;
+        var extension = Path.GetExtension(path);
+        if (!extension.Equals(".jsonl", StringComparison.OrdinalIgnoreCase) &&
+            !extension.Equals(".log", StringComparison.OrdinalIgnoreCase))
+            return false;
+        var name = Path.GetFileNameWithoutExtension(path);
+        return name.Length == 15 && name.StartsWith("cmdspy-", StringComparison.OrdinalIgnoreCase) &&
+            DateTime.TryParseExact(name[7..], "yyyyMMdd", CultureInfo.InvariantCulture,
+                DateTimeStyles.None, out date);
+    }
+
+    private void ReportRejected(string path, string reason)
+    {
+        var key = $"{Path.GetFileName(path)}|{reason}";
+        if (_reportedRejections.Add(key))
+            WriteRejected?.Invoke($"Log write rejected for {Path.GetFileName(path)}: {reason}.");
     }
 
     /// <summary>Opens a log for reading without blocking a writer.</summary>

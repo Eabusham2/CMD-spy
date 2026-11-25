@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using CmdSpy.Core.Analysis;
@@ -26,6 +27,7 @@ public sealed class Investigator : IDisposable
     private readonly WindowsEventHistory _history;
     private readonly ScheduledTaskCorrelator _tasks;
     private readonly ConcurrentDictionary<Guid, byte> _queued = new();
+    private readonly ConcurrentDictionary<Guid, int> _pending = new();
     private BlockingCollection<CmdEvent>? _queue;
     private Thread? _worker;
     private CancellationTokenSource? _cancel;
@@ -35,7 +37,12 @@ public sealed class Investigator : IDisposable
     {
         _processes = processes;
         _options = options;
-        _signatures = signatures ?? new SignatureVerifier { ComputeHashes = options.ComputeFileHashes };
+        _signatures = signatures ?? new SignatureVerifier
+        {
+            ComputeHashes = options.ComputeFileHashes,
+            MaxHashFileBytes = options.MaxHashedFileBytes,
+            MaxCacheEntries = options.MaxSignatureCacheEntries
+        };
         _taskCatalog = taskCatalog ?? new ScheduledTaskCatalog();
         _history = history ?? new WindowsEventHistory();
         _tasks = new ScheduledTaskCorrelator(_taskCatalog, _history);
@@ -55,11 +62,15 @@ public sealed class Investigator : IDisposable
     /// <summary>True while another analysis pass for this event is waiting in the queue.</summary>
     public bool IsQueued(Guid eventId) => _queued.ContainsKey(eventId);
 
+    /// <summary>True while an accepted analysis pass is queued or running.</summary>
+    public bool IsPending(Guid eventId) => _pending.ContainsKey(eventId);
+
     /// <param name="warmUp">Work to finish before the first analysis (e.g. the start-up process snapshot); capture is not held up by it.</param>
     public void Start(System.Threading.Tasks.Task? warmUp = null)
     {
         if (_worker is not null) return;
-        _queue = new BlockingCollection<CmdEvent>(new ConcurrentQueue<CmdEvent>());
+        _queue = new BlockingCollection<CmdEvent>(
+            new ConcurrentQueue<CmdEvent>(), Math.Max(1, _options.MaxPendingInvestigations));
         _cancel = new CancellationTokenSource();
         var queue = _queue;
         var token = _cancel.Token;
@@ -76,21 +87,30 @@ public sealed class Investigator : IDisposable
         _worker.Start();
     }
 
-    /// <summary>Queues an event for (re-)analysis. Already-queued events are not duplicated.</summary>
-    public void Enqueue(CmdEvent ev)
+    /// <summary>
+    /// Queues an event for (re-)analysis without blocking capture. Already-queued
+    /// events are coalesced; false means the bounded queue rejected new work.
+    /// </summary>
+    public bool Enqueue(CmdEvent ev)
     {
-        if (!_options.InvestigateEvents) return;
+        if (!_options.InvestigateEvents) return false;
         var queue = _queue;
-        if (queue is null || queue.IsAddingCompleted) return;
-        if (!_queued.TryAdd(ev.Id, 0)) return;
+        if (queue is null || queue.IsAddingCompleted) return false;
+        if (!_queued.TryAdd(ev.Id, 0)) return IsPending(ev.Id);
+
+        _pending.AddOrUpdate(ev.Id, 1, (_, count) => count + 1);
         try
         {
-            queue.Add(ev);
+            if (queue.TryAdd(ev)) return true;
         }
         catch (InvalidOperationException)
         {
-            _queued.TryRemove(ev.Id, out _);
+            // Stop raced this admission attempt.
         }
+
+        _queued.TryRemove(ev.Id, out _);
+        RemovePending(ev.Id);
+        return false;
     }
 
     /// <summary>Stops accepting work and lets queued analyses finish for up to <paramref name="drainTimeout"/>.</summary>
@@ -106,6 +126,7 @@ public sealed class Investigator : IDisposable
         _queue = null;
         _cancel = null;
         _queued.Clear();
+        _pending.Clear();
     }
 
     public void Dispose() => Stop(TimeSpan.FromSeconds(1));
@@ -134,6 +155,26 @@ public sealed class Investigator : IDisposable
             catch
             {
                 // A faulty subscriber must not stop the investigator.
+            }
+            finally
+            {
+                RemovePending(ev.Id);
+            }
+        }
+    }
+
+    private void RemovePending(Guid eventId)
+    {
+        while (_pending.TryGetValue(eventId, out var count))
+        {
+            if (count <= 1)
+            {
+                if (((ICollection<KeyValuePair<Guid, int>>)_pending)
+                    .Remove(new KeyValuePair<Guid, int>(eventId, count))) return;
+            }
+            else if (_pending.TryUpdate(eventId, count - 1, count))
+            {
+                return;
             }
         }
     }
@@ -169,19 +210,36 @@ public sealed class Investigator : IDisposable
             Revision = s.PreviousRevision + 1
         };
 
-        Step(inv, "resolving the program path", () =>
+        var elapsed = Stopwatch.StartNew();
+        var maxDuration = _options.MaxInvestigationDuration > TimeSpan.Zero
+            ? _options.MaxInvestigationDuration
+            : TimeSpan.FromSeconds(1);
+        bool budgetReported = false;
+        void Enrich(string what, Action action)
+        {
+            if (elapsed.Elapsed < maxDuration)
+            {
+                Step(inv, what, action);
+                return;
+            }
+            if (budgetReported) return;
+            budgetReported = true;
+            inv.Errors.Add($"Investigation stopped after the {maxDuration.TotalSeconds:0.#} second enrichment budget was exhausted.");
+        }
+
+        Enrich("resolving the program path", () =>
             inv.ResolvedImagePath = ProcessImageResolver.Resolve(s.ProcessId, s.ImagePath, s.Name, s.CommandLine, s.StartUtc));
 
-        Step(inv, "building the launch chain", () => inv.Ancestry = BuildAncestry(s, inv));
+        Enrich("building the launch chain", () => inv.Ancestry = BuildAncestry(s, inv));
 
         ProcessInfo? launcher = null;
-        Step(inv, "identifying the launcher", () => launcher = DetermineLauncher(inv.Ancestry, inv));
+        Enrich("identifying the launcher", () => launcher = DetermineLauncher(inv.Ancestry, inv));
 
         var parsed = CommandParser.Parse(s.CommandLine, s.Name);
 
-        Step(inv, "resolving referenced processes", () => inv.ReferencedProcesses = ResolveReferenced(parsed, s));
+        Enrich("resolving referenced processes", () => inv.ReferencedProcesses = ResolveReferenced(parsed, s));
 
-        Step(inv, "resolving action paths", () =>
+        Enrich("resolving action paths", () =>
         {
             foreach (var child in s.Children.Take(25))
                 child.ImagePath = ProcessImageResolver.Resolve(child.ProcessId, child.ImagePath, child.ProcessName,
@@ -189,12 +247,12 @@ public sealed class Investigator : IDisposable
         });
 
         if (_options.VerifySignatures)
-            Step(inv, "verifying signatures", () => inv.Signatures = VerifySignatures(inv, s, launcher));
-        Step(inv, "reading vendor information", () => FillVendorInfo(inv));
+            Enrich("verifying signatures", () => inv.Signatures = VerifySignatures(inv, s, launcher));
+        Enrich("reading vendor information", () => FillVendorInfo(inv));
 
-        Step(inv, "explaining the command", () => inv.Explanation = CommandExplainer.Explain(parsed, inv.ReferencedProcesses));
+        Enrich("explaining the command", () => inv.Explanation = CommandExplainer.Explain(parsed, inv.ReferencedProcesses));
 
-        Step(inv, "checking for suspicious indicators", () =>
+        Enrich("checking for suspicious indicators", () =>
         {
             var findings = SuspiciousCommandDetector.Analyze(new DetectionContext
             {
@@ -212,11 +270,11 @@ public sealed class Investigator : IDisposable
         });
 
         if (_options.CorrelateScheduledTasks)
-            Step(inv, "correlating scheduled tasks", () =>
+            Enrich("correlating scheduled tasks", () =>
                 inv.ScheduledTask = _tasks.Correlate(SelfInfo(s, inv), inv.Ancestry, s.StartUtc, inv.Notes));
 
         if (_options.CorrelateEventLogs)
-            Step(inv, "reading Windows event history", () => inv.History = CollectHistory(s, parsed, inv));
+            Enrich("reading Windows event history", () => inv.History = CollectHistory(s, parsed, inv));
 
         Step(inv, "assessing risk", () => inv.Risk = RiskAssessor.Assess(new RiskInput
         {
@@ -527,11 +585,16 @@ public sealed class Investigator : IDisposable
             Add(r.ImagePath, $"referenced [{r.ProcessId}]", r.ProcessId);
 
         var results = new List<SignatureInfo>();
+        long hashBytesRemaining = Math.Max(0, _options.MaxHashedBytesPerInvestigation);
         foreach (var group in targets.GroupBy(t => t.Path, StringComparer.OrdinalIgnoreCase))
         {
             var first = group.First();
             var roles = string.Join(", ", group.Select(g => g.Role).Distinct());
-            results.Add(_signatures.Verify(first.Path, roles, first.Pid));
+            var verified = _signatures.Verify(first.Path, roles, first.Pid, hashBytesRemaining);
+            results.Add(verified);
+            if (_options.ComputeFileHashes && verified.FileSize is long size && size >= 0 &&
+                size <= Math.Max(0, _options.MaxHashedFileBytes) && size <= hashBytesRemaining)
+                hashBytesRemaining -= size;
         }
         return results;
     }

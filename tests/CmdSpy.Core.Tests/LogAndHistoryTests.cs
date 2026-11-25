@@ -113,6 +113,26 @@ public class LogAndHistoryTests : IDisposable
     }
 
     [Fact]
+    public void Follower_IncrementallyReadsChunksAndSkipsOversizedLines()
+    {
+        Directory.CreateDirectory(_dir.Path);
+        var day = DateTime.Now;
+        using var follower = new LogFollower(_dir.Path, TimeSpan.FromHours(1), () => day,
+            readBufferBytes: 32, maxBytesPerPoll: 64, maxLineBytes: 2_048, maxKnownEvents: 10);
+        var valid = System.Text.Json.JsonSerializer.Serialize(NewEvent(9));
+        File.WriteAllText(follower.PathFor(day), new string('x', 4_096) + Environment.NewLine +
+            valid + Environment.NewLine, Encoding.UTF8);
+
+        var existing = follower.Start();
+        var captured = new List<CmdEvent>();
+        follower.EventCaptured += (_, e) => captured.Add(e);
+        for (int i = 0; i < 100 && captured.Count == 0; i++) follower.Poll();
+
+        Assert.Empty(existing);
+        Assert.Equal(9, Assert.Single(captured).ProcessId);
+    }
+
+    [Fact]
     public void Store_CanBeReadWhileAnotherHandleIsWriting()
     {
         var store = new EventStore(_dir.Path);

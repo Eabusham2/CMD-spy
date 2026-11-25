@@ -44,6 +44,8 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
     // Children, grandchildren... of tracked popups, mapped to the outermost
     // popup they belong to, so their actions and connections are attributed.
     private readonly ConcurrentDictionary<int, DescendantLink> _descendants = new();
+    private readonly object _descendantLimitLock = new();
+    private int _trackedDescendantCount;
 
     // Popups that exited before their analysis finished: the human-readable
     // final record waits for the analysis so it can include it.
@@ -54,6 +56,19 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
     // Connections reported before the matching process-start event was handled
     // (network and process events come from separate ETW sessions).
     private readonly ConcurrentDictionary<int, List<NetworkConnectionInfo>> _pendingConnections = new();
+    private readonly object _pendingConnectionLimitLock = new();
+    private DateTimeOffset _pendingConnectionsPrunedAt;
+
+    // Admission is counted before expensive capture enrichment or persistence.
+    // The dictionary is reset every minute, so attacker-controlled event volume
+    // cannot create unbounded limiter state.
+    private readonly object _captureRateLock = new();
+    private readonly Dictionary<int, int> _capturesBySession = new();
+    private DateTimeOffset _captureWindowStart;
+    private int _capturesThisWindow;
+    private bool _captureLimitReported;
+    private int _investigationLimitReported;
+    private int _descendantLimitReported;
 
     private sealed record DescendantLink(CmdEvent Root, int Depth, DateTimeOffset StartUtc);
 
@@ -69,7 +84,10 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
     public CmdSpyEngine(CmdSpyOptions? options = null)
     {
         _options = options ?? new CmdSpyOptions();
-        _store = new EventStore(_options.LogDirectory);
+        _store = new EventStore(_options.LogDirectory, _options.MaxLogFileBytes,
+            _options.LogRetentionDays, _options.MinLogVolumeFreeBytes, _options.MaxLogDirectoryBytes,
+            _options.MaxLogRecordBytes);
+        _store.WriteRejected += message => Status?.Invoke(this, message);
         _targetStems = _options.TargetStems();
         _processes = new ProcessCache(_options.ProcessHistoryRetention);
     }
@@ -128,10 +146,12 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
 
         if (_options.InvestigateEvents)
         {
+            System.Threading.Interlocked.Exchange(ref _investigationLimitReported, 0);
             _investigator = new Investigator(_processes, _options);
             _investigator.Completed += OnInvestigationCompleted;
             _investigator.Start(warmUp);
         }
+        System.Threading.Interlocked.Exchange(ref _descendantLimitReported, 0);
 
         _watcher = _watcherFactory is null ? StartBestWatcher() : StartWatcher(_watcherFactory());
         IsRunning = true;
@@ -209,7 +229,12 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
             bool isTarget = _targetStems.Contains(stem);
 
             if (isTarget)
-                CaptureCmdPopup(e);
+            {
+                if (TryAdmitCapture(e.SessionId, e.TimestampUtc, out var reportLimit))
+                    CaptureCmdPopup(e);
+                else if (reportLimit)
+                    Status?.Invoke(this, "Capture rate limit reached; additional target launches are being dropped for this minute.");
+            }
 
             // Independently, if this new process is a child of a cmd popup we are
             // already tracking, record it as one of that popup's "actions" —
@@ -231,21 +256,54 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
                 if (_descendants.TryGetValue(e.ParentProcessId, out var link) &&
                     IsSameIncarnation(e.ParentProcessId, link.StartUtc, e.TimestampUtc))
                     outer = link;
+                else if (link is not null)
+                    TryRemoveDescendant(e.ParentProcessId, out _);
 
-                if (direct is not null)
-                    AttachChild(direct, e);
-                if (outer is not null && !ReferenceEquals(outer.Root, direct))
-                    AttachChild(outer.Root, e, outer.Depth + 1);
+                bool directAttached = direct is not null && AttachChild(direct, e);
+                bool outerAttached = outer is not null &&
+                    (ReferenceEquals(outer.Root, direct)
+                        ? directAttached
+                        : AttachChild(outer.Root, e, outer.Depth + 1));
 
-                if (outer is not null)
-                    _descendants[e.ProcessId] = new DescendantLink(outer.Root, outer.Depth + 1, e.TimestampUtc);
-                else if (direct is not null)
-                    _descendants[e.ProcessId] = new DescendantLink(direct, 1, e.TimestampUtc);
+                if (outer is not null && outerAttached)
+                    TrackDescendant(e.ProcessId, new DescendantLink(outer.Root, outer.Depth + 1, e.TimestampUtc));
+                else if (direct is not null && directAttached)
+                    TrackDescendant(e.ProcessId, new DescendantLink(direct, 1, e.TimestampUtc));
             }
         }
         catch (Exception ex)
         {
             Status?.Invoke(this, $"Error handling process start: {ex.Message}");
+        }
+    }
+
+    private bool TryAdmitCapture(int sessionId, DateTimeOffset timestampUtc, out bool reportLimit)
+    {
+        lock (_captureRateLock)
+        {
+            if (_captureWindowStart == default || timestampUtc < _captureWindowStart ||
+                timestampUtc - _captureWindowStart >= TimeSpan.FromMinutes(1))
+            {
+                _captureWindowStart = timestampUtc;
+                _capturesThisWindow = 0;
+                _capturesBySession.Clear();
+                _captureLimitReported = false;
+            }
+
+            int globalLimit = Math.Max(1, _options.MaxCapturedEventsPerMinute);
+            int sessionLimit = Math.Max(1, _options.MaxCapturedEventsPerSessionPerMinute);
+            _capturesBySession.TryGetValue(sessionId, out var sessionCount);
+            if (_capturesThisWindow >= globalLimit || sessionCount >= sessionLimit)
+            {
+                reportLimit = !_captureLimitReported;
+                _captureLimitReported = true;
+                return false;
+            }
+
+            _capturesThisWindow++;
+            _capturesBySession[sessionId] = sessionCount + 1;
+            reportLimit = false;
+            return true;
         }
     }
 
@@ -339,7 +397,8 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
 
         // Networking snapshot.
         if (_options.CaptureNetwork)
-            ev.NetworkConnections = NetworkInspector.GetConnectionsForPid(e.ProcessId);
+            ev.NetworkConnections = NetworkInspector.GetConnectionsForPid(
+                e.ProcessId, Math.Max(1, _options.MaxNetworkConnectionsPerEvent));
 
         _active[e.ProcessId] = ev;
         EvictStaleTracking(e.TimestampUtc);
@@ -347,7 +406,7 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
         EventCaptured?.Invoke(this, ev);
 
         DrainPendingConnections(e.ProcessId, ev, e.TimestampUtc);
-        _investigator?.Enqueue(ev);
+        QueueInvestigation(ev);
     }
 
     /// <summary>
@@ -368,14 +427,19 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
         foreach (var pair in _descendants)
         {
             if (nowUtc - pair.Value.StartUtc > window)
-                _descendants.TryRemove(pair.Key, out _);
+                TryRemoveDescendant(pair.Key, out _);
         }
         PruneRecentlyExited(nowUtc);
         if (_finalWritten.Count > 20_000) _finalWritten.Clear();
     }
 
-    private void AttachChild(CmdEvent parentEvent, ProcessStartedEventArgs child, int depth = 1)
+    private bool AttachChild(CmdEvent parentEvent, ProcessStartedEventArgs child, int depth = 1)
     {
+        int detailLimit = Math.Max(1, _options.MaxDescendantsPerEvent);
+        int childCount;
+        lock (parentEvent)
+            if (parentEvent.ChildProcesses.Count >= detailLimit) return false;
+
         var info = new ProcessInfo
         {
             ProcessId = child.ProcessId,
@@ -404,25 +468,62 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
         {
             // A popup that spawns hundreds of processes (a build script...) is
             // capped so one event can't grow without bound.
-            if (parentEvent.ChildProcesses.Count >= Math.Max(1, _options.MaxDescendantsPerEvent))
-                return;
+            if (parentEvent.ChildProcesses.Count >= detailLimit)
+                return false;
 
             parentEvent.ChildProcesses.Add(info);
+            childCount = parentEvent.ChildProcesses.Count;
 
             // A cmd popup that opened a socket is worth re-snapshotting.
             if (_options.CaptureNetwork)
             {
-                var conns = NetworkInspector.GetConnectionsForPid(parentEvent.ProcessId);
+                var conns = NetworkInspector.GetConnectionsForPid(parentEvent.ProcessId,
+                    Math.Max(1, _options.MaxNetworkConnectionsPerEvent));
                 if (conns.Count > parentEvent.NetworkConnections.Count)
                     parentEvent.NetworkConnections = conns;
             }
         }
 
-        _store.AppendUpdate(parentEvent, "child-process");
+        if (ShouldPersistDetail(childCount, detailLimit))
+            _store.AppendUpdate(parentEvent, "child-process");
         EventUpdated?.Invoke(this, parentEvent);
 
         DrainPendingConnections(child.ProcessId, parentEvent, child.TimestampUtc);
-        _investigator?.Enqueue(parentEvent);   // re-analyse with the new action
+        QueueInvestigation(parentEvent);   // re-analyse with the new action
+        return true;
+    }
+
+    private void TrackDescendant(int processId, DescendantLink link)
+    {
+        bool reportLimit = false;
+        lock (_descendantLimitLock)
+        {
+            if (_descendants.ContainsKey(processId))
+            {
+                _descendants[processId] = link;
+                return;
+            }
+            if (_trackedDescendantCount >= Math.Max(1, _options.MaxTrackedDescendantProcesses))
+            {
+                reportLimit = true;
+            }
+            else
+            {
+                if (_descendants.TryAdd(processId, link)) _trackedDescendantCount++;
+            }
+        }
+        if (reportLimit && System.Threading.Interlocked.Exchange(ref _descendantLimitReported, 1) == 0)
+            Status?.Invoke(this, "Descendant tracking limit reached; additional process relationships are being skipped.");
+    }
+
+    private bool TryRemoveDescendant(int processId, out DescendantLink? link)
+    {
+        lock (_descendantLimitLock)
+        {
+            if (!_descendants.TryRemove(processId, out link)) return false;
+            _trackedDescendantCount--;
+            return true;
+        }
     }
 
     private void OnProcessStopped(object? sender, ProcessStoppedEventArgs e)
@@ -442,7 +543,8 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
 
             // A fast popup often exits before its analysis lands; the finalized
             // log block then waits for the analysis so it can include it.
-            analysisPending = _investigator is { IsRunning: true } && _options.InvestigateEvents && ev.Investigation is null;
+            analysisPending = _investigator is { IsRunning: true } investigator &&
+                investigator.IsPending(ev.Id) && ev.Investigation is null;
             if (analysisPending) _exitPendingAnalysis[ev.Id] = ev;
         }
 
@@ -461,10 +563,10 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
     private void RecordDescendantExit(ProcessStoppedEventArgs e)
     {
         var owners = new List<CmdEvent>(2);
-        if (_descendants.TryRemove(e.ProcessId, out var link))
+        if (TryRemoveDescendant(e.ProcessId, out var link) && link is not null)
         {
             owners.Add(link.Root);
-            _recentlyExitedDescendants[e.ProcessId] = new ExitedLink(link.Root, link.StartUtc, e.TimestampUtc);
+            RememberExitedDescendant(e.ProcessId, new ExitedLink(link.Root, link.StartUtc, e.TimestampUtc));
         }
         var record = _processes.TryGet(e.ProcessId, e.TimestampUtc);
         if (record is not null && _active.TryGetValue(record.ParentProcessId, out var directParent) && !owners.Contains(directParent))
@@ -485,6 +587,17 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
                     }
                 }
             }
+        }
+    }
+
+    private void RememberExitedDescendant(int processId, ExitedLink link)
+    {
+        lock (_descendantLimitLock)
+        {
+            int limit = Math.Max(1, _options.MaxTrackedDescendantProcesses);
+            if (_recentlyExitedDescendants.Count >= limit) PruneRecentlyExited(link.ExitUtc);
+            if (_recentlyExitedDescendants.Count < limit)
+                _recentlyExitedDescendants[processId] = link;
         }
     }
 
@@ -511,8 +624,9 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
     {
         if (_investigator is null) return false;
         _reanalysisRequested[ev.Id] = 0;
-        _investigator.Enqueue(ev);
-        return true;
+        if (QueueInvestigation(ev)) return true;
+        _reanalysisRequested.TryRemove(ev.Id, out _);
+        return false;
     }
 
     /// <summary>
@@ -537,7 +651,11 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
             if (_investigator is { IsRunning: true })
             {
                 _exitPendingAnalysis[ev.Id] = ev;   // final block once analysed
-                _investigator.Enqueue(ev);
+                if (!QueueInvestigation(ev))
+                {
+                    _exitPendingAnalysis.TryRemove(ev.Id, out _);
+                    WriteExit(ev);
+                }
             }
         }
         return imported;
@@ -576,15 +694,28 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
     private void AddConnection(CmdEvent target, NetworkConnectionInfo connection)
     {
         bool added;
+        int count;
+        int detailLimit = Math.Max(1, _options.MaxNetworkConnectionsPerEvent);
         lock (target)
         {
-            added = !target.NetworkConnections.Any(c => SameEndpoint(c, connection));
+            added = target.NetworkConnections.Count < detailLimit &&
+                !target.NetworkConnections.Any(c => SameEndpoint(c, connection));
             if (added) target.NetworkConnections.Add(connection);
+            count = target.NetworkConnections.Count;
         }
         if (!added) return;
-        _store.AppendUpdate(target, "network");
+        if (ShouldPersistDetail(count, detailLimit))
+            _store.AppendUpdate(target, "network");
         EventUpdated?.Invoke(this, target);
     }
+
+    /// <summary>
+    /// Persists exponentially spaced detail snapshots plus the configured cap.
+    /// Ordinary events keep every early update; exit and analysis paths still
+    /// force a final full snapshot.
+    /// </summary>
+    private static bool ShouldPersistDetail(int count, int limit) =>
+        count <= 16 || count == limit || (count > 0 && (count & (count - 1)) == 0);
 
     /// <summary>True if the connection happened while that (now exited) process was alive.</summary>
     private static bool Within(NetworkConnectionInfo connection, ExitedLink link) =>
@@ -608,12 +739,28 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
 
     private void BufferConnection(int pid, NetworkConnectionInfo connection)
     {
-        var list = _pendingConnections.GetOrAdd(pid, _ => new List<NetworkConnectionInfo>());
+        if (!_pendingConnections.TryGetValue(pid, out var list))
+        {
+            lock (_pendingConnectionLimitLock)
+            {
+                if (!_pendingConnections.TryGetValue(pid, out list))
+                {
+                    var now = connection.ObservedAtUtc ?? DateTimeOffset.UtcNow;
+                    if (_pendingConnections.Count >= 1_000 &&
+                        now - _pendingConnectionsPrunedAt >= TimeSpan.FromSeconds(15))
+                    {
+                        PrunePendingConnections();
+                        _pendingConnectionsPrunedAt = now;
+                    }
+                    if (_pendingConnections.Count >= 1_000) return;
+                    list = _pendingConnections.GetOrAdd(pid, _ => new List<NetworkConnectionInfo>());
+                }
+            }
+        }
         lock (list)
         {
             if (list.Count < 20) list.Add(connection);
         }
-        if (_pendingConnections.Count > 1_000) PrunePendingConnections();
     }
 
     private void DrainPendingConnections(int pid, CmdEvent target, DateTimeOffset startUtc)
@@ -637,6 +784,16 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
         }
     }
 
+    private bool QueueInvestigation(CmdEvent ev)
+    {
+        var investigator = _investigator;
+        if (investigator is null || !investigator.IsRunning) return false;
+        if (investigator.Enqueue(ev)) return true;
+        if (System.Threading.Interlocked.Exchange(ref _investigationLimitReported, 1) == 0)
+            Status?.Invoke(this, "Investigation queue is full; new analyses are being skipped until capacity is available.");
+        return false;
+    }
+
     public void Stop()
     {
         if (!IsRunning) return;
@@ -655,7 +812,11 @@ public sealed class CmdSpyEngine : IDisposable, ICaptureFeed
 
         IsRunning = false;
         _active.Clear();
-        _descendants.Clear();
+        lock (_descendantLimitLock)
+        {
+            _descendants.Clear();
+            _trackedDescendantCount = 0;
+        }
         _pendingConnections.Clear();
         _reanalysisRequested.Clear();
         _recentlyExited.Clear();

@@ -162,9 +162,11 @@ public sealed partial class MainForm
             return;
         }
         // The capturing engine logs the new report; otherwise analyse here (shown in this window).
-        if (!(_engine.IsRunning && _follower is null && _engine.Reanalyze(ev)))
-            OnDemand().Enqueue(ev);
-        _lblStatus.Text = $"Re-analysing #{ev.SequenceNumber} ({ev.ProcessName})…";
+        bool queued = _engine.IsRunning && _follower is null && _engine.Reanalyze(ev);
+        if (!queued) queued = OnDemand().Enqueue(ev);
+        _lblStatus.Text = queued
+            ? $"Re-analysing #{ev.SequenceNumber} ({ev.ProcessName})…"
+            : "The investigation queue is full; try re-analysing again shortly.";
     }
 
     private void CopySelectedReport()
@@ -188,6 +190,7 @@ public sealed partial class MainForm
         {
             var known = _all.ToList();
             IReadOnlyList<CmdEvent> imported;
+            int skippedAnalysis = 0;
             bool viaEngine = _engine.IsRunning && _follower is null;
             if (viaEngine)
             {
@@ -201,7 +204,7 @@ public sealed partial class MainForm
                 foreach (var ev in imported)
                 {
                     OnCaptured(ev);
-                    investigator.Enqueue(ev);
+                    if (!investigator.Enqueue(ev)) skippedAnalysis++;
                 }
             }
 
@@ -209,7 +212,9 @@ public sealed partial class MainForm
             {
                 MessageBox.Show(this,
                     $"Imported {imported.Count} past launch(es) of console/script hosts from the Windows event logs.\n\n" +
-                    "Each one is being analysed now (launch chain, signatures, scheduled task, risk) — watch the Risk column." +
+                    (skippedAnalysis == 0
+                        ? "Each one is being analysed now (launch chain, signatures, scheduled task, risk) — watch the Risk column."
+                        : $"{imported.Count - skippedAnalysis} are being analysed; {skippedAnalysis} were skipped because the investigation queue is full.") +
                     (viaEngine ? "" : "\n\nThey are shown here only; the boot service owns the log files."),
                     "CMD-spy — history import", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }

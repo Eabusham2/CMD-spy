@@ -233,6 +233,75 @@ public class EngineTests : IDisposable
         Assert.Equal(2, captured!.Investigation!.Revision);
     }
 
+    [Fact]
+    public void TargetBurstIsRateLimitedBeforePersistence()
+    {
+        var options = new CmdSpyOptions
+        {
+            LogDirectory = _dir.Path,
+            SeedProcessCache = false,
+            InvestigateEvents = false,
+            CaptureNetwork = false,
+            MaxCapturedEventsPerMinute = 2,
+            MaxCapturedEventsPerSessionPerMinute = 2,
+            MinLogVolumeFreeBytes = 0
+        };
+        using var engine = new CmdSpyEngine(options, () => _watcher);
+        var captured = new System.Collections.Generic.List<CmdEvent>();
+        var statuses = new System.Collections.Generic.List<string>();
+        engine.EventCaptured += (_, ev) => captured.Add(ev);
+        engine.Status += (_, status) => statuses.Add(status);
+        engine.Start();
+        var at = DateTimeOffset.UtcNow;
+
+        _watcher.Started(Cmd, 0, "cmd.exe", "cmd.exe /c echo one", at);
+        _watcher.Started(Cmd + 1, 0, "cmd.exe", "cmd.exe /c echo two", at.AddSeconds(1));
+        _watcher.Started(Cmd + 2, 0, "cmd.exe", "cmd.exe /c echo three", at.AddSeconds(2));
+
+        Assert.Equal(2, captured.Count);
+        Assert.Equal(2, engine.Store.ReadToday().Count());
+        Assert.Contains(statuses, status => status.Contains("rate limit", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void NetworkSnapshotsAreBoundedAndCoalesced()
+    {
+        var options = new CmdSpyOptions
+        {
+            LogDirectory = _dir.Path,
+            SeedProcessCache = false,
+            InvestigateEvents = false,
+            CaptureNetwork = true,
+            CaptureNetworkEvents = true,
+            MaxNetworkConnectionsPerEvent = 32,
+            MinLogVolumeFreeBytes = 0
+        };
+        using var engine = new CmdSpyEngine(options, () => _watcher);
+        CmdEvent? captured = null;
+        engine.EventCaptured += (_, ev) => captured = ev;
+        engine.Start();
+        var at = DateTimeOffset.UtcNow;
+        _watcher.Started(Cmd, 0, "cmd.exe", "cmd.exe /c curl example.test", at);
+
+        for (int i = 0; i < 40; i++)
+        {
+            engine.OnConnectionObserved(Cmd, new NetworkConnectionInfo
+            {
+                Protocol = "TCP",
+                LocalAddress = "127.0.0.1",
+                LocalPort = 50_000 + i,
+                RemoteAddress = "192.0.2.1",
+                RemotePort = 443,
+                OwningPid = Cmd,
+                ObservedAtUtc = at.AddMilliseconds(i)
+            });
+        }
+
+        Assert.Equal(32, captured!.NetworkConnections.Count);
+        Assert.Equal(32, engine.Store.ReadToday().Single().NetworkConnections.Count);
+        Assert.Equal(18, File.ReadLines(engine.Store.CurrentJsonlPath).Count());
+    }
+
     private static string ReadShared(string path)
     {
         if (!File.Exists(path)) return "";

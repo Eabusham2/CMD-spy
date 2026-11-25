@@ -72,19 +72,21 @@ public static class NetworkInspector
         public uint owningPid;
     }
 
-    /// <summary>Returns every connection currently owned by <paramref name="pid"/>.</summary>
-    public static List<NetworkConnectionInfo> GetConnectionsForPid(int pid)
+    /// <summary>Returns up to <paramref name="maxResults"/> connections owned by <paramref name="pid"/>.</summary>
+    public static List<NetworkConnectionInfo> GetConnectionsForPid(int pid, int maxResults = int.MaxValue)
     {
         var results = new List<NetworkConnectionInfo>();
-        try { ReadTcp(AF_INET, pid, results); } catch { /* ignore */ }
-        try { ReadTcp(AF_INET6, pid, results); } catch { /* ignore */ }
-        try { ReadUdp(AF_INET, pid, results); } catch { /* ignore */ }
-        try { ReadUdp(AF_INET6, pid, results); } catch { /* ignore */ }
+        int limit = Math.Max(1, maxResults);
+        try { ReadTcp(AF_INET, pid, results, limit); } catch { /* ignore */ }
+        try { ReadTcp(AF_INET6, pid, results, limit); } catch { /* ignore */ }
+        try { ReadUdp(AF_INET, pid, results, limit); } catch { /* ignore */ }
+        try { ReadUdp(AF_INET6, pid, results, limit); } catch { /* ignore */ }
         return results;
     }
 
-    private static void ReadTcp(int family, int pid, List<NetworkConnectionInfo> results)
+    private static void ReadTcp(int family, int pid, List<NetworkConnectionInfo> results, int limit)
     {
+        if (results.Count >= limit) return;
         int size = 0;
         GetExtendedTcpTable(IntPtr.Zero, ref size, false, family, TCP_TABLE_OWNER_PID_ALL, 0);
         if (size == 0) return;
@@ -116,6 +118,7 @@ public static class NetworkInspector
                         State = TcpState(r.state),
                         OwningPid = (int)r.owningPid
                     });
+                    if (results.Count >= limit) break;
                 }
             }
             else
@@ -136,6 +139,7 @@ public static class NetworkInspector
                         State = TcpState(r.state),
                         OwningPid = (int)r.owningPid
                     });
+                    if (results.Count >= limit) break;
                 }
             }
         }
@@ -145,8 +149,9 @@ public static class NetworkInspector
         }
     }
 
-    private static void ReadUdp(int family, int pid, List<NetworkConnectionInfo> results)
+    private static void ReadUdp(int family, int pid, List<NetworkConnectionInfo> results, int limit)
     {
+        if (results.Count >= limit) return;
         int size = 0;
         GetExtendedUdpTable(IntPtr.Zero, ref size, false, family, UDP_TABLE_OWNER_PID, 0);
         if (size == 0) return;
@@ -175,6 +180,7 @@ public static class NetworkInspector
                         LocalPort = NetworkPort(r.localPort),
                         OwningPid = (int)r.owningPid
                     });
+                    if (results.Count >= limit) break;
                 }
             }
             else
@@ -192,6 +198,7 @@ public static class NetworkInspector
                         LocalPort = NetworkPort(r.localPort),
                         OwningPid = (int)r.owningPid
                     });
+                    if (results.Count >= limit) break;
                 }
             }
         }

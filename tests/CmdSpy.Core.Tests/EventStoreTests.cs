@@ -179,4 +179,40 @@ public class EventStoreTests : IDisposable
         var store = new EventStore(_dir);
         Assert.Empty(store.ReadToday());
     }
+
+    [Fact]
+    public void Append_RejectsWholeRecordsAtConfiguredQuotas()
+    {
+        var rejected = new System.Collections.Generic.List<string>();
+        var store = new EventStore(_dir, maxFileBytes: 2_000, retentionDays: 7,
+            minFreeBytes: 0, maxDirectoryBytes: 3_000);
+        store.WriteRejected += rejected.Add;
+
+        for (int i = 0; i < 20; i++)
+            store.Append(NewEvent(pid: 10_000 + i, seq: i + 1));
+
+        Assert.True(new FileInfo(store.CurrentJsonlPath).Length <= 2_000);
+        Assert.True(new FileInfo(store.CurrentLogPath).Length <= 2_000);
+        Assert.True(Directory.EnumerateFiles(_dir).Sum(path => new FileInfo(path).Length) <= 3_000);
+        Assert.NotEmpty(rejected);
+        Assert.All(File.ReadLines(store.CurrentJsonlPath), line => Assert.NotNull(EventStore.ParseLine(line)));
+    }
+
+    [Fact]
+    public void Constructor_PrunesOnlyExpiredDatedLogs()
+    {
+        Directory.CreateDirectory(_dir);
+        var expired = Path.Combine(_dir, $"cmdspy-{DateTime.Today.AddDays(-30):yyyyMMdd}.jsonl");
+        var recent = Path.Combine(_dir, $"cmdspy-{DateTime.Today.AddDays(-1):yyyyMMdd}.log");
+        var unrelated = Path.Combine(_dir, "cmdspy-service.log");
+        File.WriteAllText(expired, "old");
+        File.WriteAllText(recent, "recent");
+        File.WriteAllText(unrelated, "status");
+
+        _ = new EventStore(_dir, retentionDays: 7, minFreeBytes: 0);
+
+        Assert.False(File.Exists(expired));
+        Assert.True(File.Exists(recent));
+        Assert.True(File.Exists(unrelated));
+    }
 }

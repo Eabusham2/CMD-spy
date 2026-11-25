@@ -24,10 +24,16 @@ public sealed class SignatureVerifier
 
     public bool ComputeHashes { get; init; } = true;
 
+    /// <summary>Files larger than this are verified but not read end-to-end for SHA-256.</summary>
+    public long MaxHashFileBytes { get; init; } = 64L * 1024 * 1024;
+
+    /// <summary>Maximum path/version results retained between verification calls.</summary>
+    public int MaxCacheEntries { get; init; } = 4_096;
+
     /// <summary>Verifies <paramref name="path"/>; the result is a copy carrying the given role/PID.</summary>
-    public SignatureInfo Verify(string path, string role, int? processId = null)
+    public SignatureInfo Verify(string path, string role, int? processId = null, long maxHashBytes = long.MaxValue)
     {
-        var info = VerifyCached(path);
+        var info = VerifyCached(path, Math.Max(0, maxHashBytes));
         var copy = Clone(info);
         copy.Role = role;
         copy.ProcessId = processId;
@@ -50,7 +56,7 @@ public sealed class SignatureVerifier
         }
     }
 
-    private SignatureInfo VerifyCached(string path)
+    private SignatureInfo VerifyCached(string path, long maxHashBytes)
     {
         long size = -1;
         DateTime written = default;
@@ -68,14 +74,19 @@ public sealed class SignatureVerifier
         }
 
         if (_cache.TryGetValue(path, out var cached) && cached.Size == size && cached.Written == written)
-            return cached.Info;
+        {
+            bool hashRequired = ComputeHashes && size >= 0 &&
+                size <= Math.Max(0, MaxHashFileBytes) && size <= maxHashBytes;
+            if (!hashRequired || cached.Info.Sha256 is not null) return cached.Info;
+        }
 
-        var info = VerifyUncached(path, size);
+        var info = VerifyUncached(path, size, maxHashBytes);
+        if (_cache.Count >= Math.Max(1, MaxCacheEntries)) _cache.Clear();
         _cache[path] = (size, written, info);
         return info;
     }
 
-    private SignatureInfo VerifyUncached(string path, long size)
+    private SignatureInfo VerifyUncached(string path, long size, long maxHashBytes)
     {
         var info = new SignatureInfo { Path = path };
         if (size < 0 || !File.Exists(path))
@@ -99,7 +110,7 @@ public sealed class SignatureVerifier
         {
         }
 
-        if (ComputeHashes)
+        if (ComputeHashes && size <= Math.Max(0, MaxHashFileBytes) && size <= maxHashBytes)
         {
             try
             {
@@ -110,6 +121,10 @@ public sealed class SignatureVerifier
             {
                 info.Detail = $"Could not hash the file: {ex.Message}";
             }
+        }
+        else if (ComputeHashes)
+        {
+            info.Detail = "SHA-256 skipped because the file exceeds a hashing budget.";
         }
 
         if (!OperatingSystem.IsWindows())

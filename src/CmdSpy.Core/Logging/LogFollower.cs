@@ -19,17 +19,34 @@ public sealed class LogFollower : ICaptureFeed, IDisposable
     private readonly string _directory;
     private readonly TimeSpan _interval;
     private readonly Dictionary<Guid, CmdEvent> _known = new();
+    private readonly Queue<Guid> _knownOrder = new();
     private readonly Func<DateTime> _clock;
+    private readonly byte[] _readBuffer;
+    private readonly byte[] _lineBuffer;
+    private readonly int _maxBytesPerPoll;
+    private readonly int _maxKnownEvents;
     private Timer? _timer;
     private string? _path;
     private long _position;
+    private int _lineLength;
+    private bool _discardingOversizedLine;
     private int _busy;
 
     public LogFollower(string directory, TimeSpan? interval = null, Func<DateTime>? clock = null)
+        : this(directory, interval, clock, 64 * 1024, 1024 * 1024, 1024 * 1024 + 3, 10_000)
+    {
+    }
+
+    internal LogFollower(string directory, TimeSpan? interval, Func<DateTime>? clock,
+        int readBufferBytes, int maxBytesPerPoll, int maxLineBytes, int maxKnownEvents)
     {
         _directory = directory;
         _interval = interval ?? TimeSpan.FromMilliseconds(500);
         _clock = clock ?? (() => DateTime.Now);
+        _readBuffer = new byte[Math.Max(1, readBufferBytes)];
+        _lineBuffer = new byte[Math.Max(1, maxLineBytes)];
+        _maxBytesPerPoll = Math.Max(_readBuffer.Length, maxBytesPerPoll);
+        _maxKnownEvents = Math.Max(1, maxKnownEvents);
     }
 
     public event EventHandler<CmdEvent>? EventCaptured;
@@ -42,16 +59,15 @@ public sealed class LogFollower : ICaptureFeed, IDisposable
     public string PathFor(DateTime day) => Path.Combine(_directory, $"cmdspy-{day:yyyyMMdd}.jsonl");
 
     /// <summary>
-    /// Reads everything already in today's log (returned, last snapshot per
-    /// event, in capture order — no events are raised for these), then keeps
-    /// following the file and raises <see cref="EventCaptured"/> /
-    /// <see cref="EventUpdated"/> for whatever is written after.
+    /// Reads the first bounded chunk already in today's log (returned in capture
+    /// order, with no events raised), then incrementally catches up and raises
+    /// <see cref="EventCaptured"/> / <see cref="EventUpdated"/> for later chunks.
     /// </summary>
     public IReadOnlyList<CmdEvent> Start()
     {
         var existing = new List<CmdEvent>();
         _path = PathFor(_clock());
-        _position = 0;
+        ResetReadState();
         foreach (var ev in ReadNewLines(_path))
         {
             if (_known.TryGetValue(ev.Id, out var known))
@@ -60,8 +76,9 @@ public sealed class LogFollower : ICaptureFeed, IDisposable
             }
             else
             {
-                _known[ev.Id] = ev;
+                Remember(ev);
                 existing.Add(ev);
+                if (existing.Count > _maxKnownEvents) existing.RemoveAt(0);
             }
         }
 
@@ -88,8 +105,9 @@ public sealed class LogFollower : ICaptureFeed, IDisposable
             {
                 // Midnight: drain what's left of yesterday's file, then switch.
                 Dispatch(ReadNewLines(_path));
+                if (HasUnreadBytes(_path)) return;
                 _path = today;
-                _position = 0;
+                ResetReadState();
             }
             _path ??= today;
             Dispatch(ReadNewLines(_path));
@@ -115,18 +133,24 @@ public sealed class LogFollower : ICaptureFeed, IDisposable
             }
             else
             {
-                _known[ev.Id] = ev;
-                if (_known.Count > 50_000) _known.Clear();   // bound memory on very long sessions
+                Remember(ev);
                 EventCaptured?.Invoke(this, ev);
             }
         }
     }
 
+    private void Remember(CmdEvent ev)
+    {
+        _known[ev.Id] = ev;
+        _knownOrder.Enqueue(ev.Id);
+        while (_known.Count > _maxKnownEvents && _knownOrder.TryDequeue(out var oldest))
+            _known.Remove(oldest);
+    }
+
     /// <summary>
-    /// Parses the complete lines added since the last read. Works on bytes and
-    /// stops at the last newline, so a line the writer is still in the middle
-    /// of (or a multi-byte character split across reads) is picked up whole on
-    /// the next poll.
+    /// Parses a bounded byte window added since the last read. Incomplete UTF-8
+    /// lines are retained in a fixed-size buffer for the next poll; oversized
+    /// lines are discarded through their newline without allocating their tail.
     /// </summary>
     private List<CmdEvent> ReadNewLines(string path)
     {
@@ -134,31 +158,67 @@ public sealed class LogFollower : ICaptureFeed, IDisposable
         if (!File.Exists(path)) return result;
 
         using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        if (fs.Length < _position) _position = 0;   // file was replaced
+        if (fs.Length < _position) ResetReadState();   // file was replaced
         if (fs.Length == _position) return result;
 
         fs.Seek(_position, SeekOrigin.Begin);
-        var buffer = new byte[fs.Length - _position];
-        int read = 0;
-        while (read < buffer.Length)
+        int remaining = _maxBytesPerPoll;
+        while (remaining > 0)
         {
-            int n = fs.Read(buffer, read, buffer.Length - read);
+            int requested = Math.Min(_readBuffer.Length, remaining);
+            int n = fs.Read(_readBuffer, 0, requested);
             if (n <= 0) break;
-            read += n;
-        }
-
-        if (read == 0) return result;
-        int lastNewline = Array.LastIndexOf(buffer, (byte)'\n', read - 1);
-        if (lastNewline < 0) return result;   // no complete line yet
-
-        var text = Encoding.UTF8.GetString(buffer, 0, lastNewline + 1);
-        _position += lastNewline + 1;
-
-        foreach (var raw in text.Split('\n'))
-        {
-            var ev = EventStore.ParseLine(raw.TrimStart('﻿').TrimEnd('\r'));
-            if (ev is not null) result.Add(ev);
+            _position += n;
+            remaining -= n;
+            ParseChunk(_readBuffer, n, result);
+            if (n < requested) break;
         }
         return result;
+    }
+
+    private void ParseChunk(byte[] bytes, int count, List<CmdEvent> result)
+    {
+        int segmentStart = 0;
+        for (int i = 0; i < count; i++)
+        {
+            if (bytes[i] != (byte)'\n') continue;
+            AppendLineBytes(bytes, segmentStart, i - segmentStart);
+            if (!_discardingOversizedLine)
+            {
+                var text = Encoding.UTF8.GetString(_lineBuffer, 0, _lineLength);
+                var ev = EventStore.ParseLine(text.TrimStart('﻿').TrimEnd('\r'));
+                if (ev is not null) result.Add(ev);
+            }
+            _lineLength = 0;
+            _discardingOversizedLine = false;
+            segmentStart = i + 1;
+        }
+        AppendLineBytes(bytes, segmentStart, count - segmentStart);
+    }
+
+    private void AppendLineBytes(byte[] bytes, int offset, int count)
+    {
+        if (count <= 0 || _discardingOversizedLine) return;
+        if (count > _lineBuffer.Length - _lineLength)
+        {
+            _lineLength = 0;
+            _discardingOversizedLine = true;
+            return;
+        }
+        Buffer.BlockCopy(bytes, offset, _lineBuffer, _lineLength, count);
+        _lineLength += count;
+    }
+
+    private bool HasUnreadBytes(string path)
+    {
+        try { return File.Exists(path) && new FileInfo(path).Length > _position; }
+        catch { return true; }
+    }
+
+    private void ResetReadState()
+    {
+        _position = 0;
+        _lineLength = 0;
+        _discardingOversizedLine = false;
     }
 }

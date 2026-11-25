@@ -26,6 +26,12 @@ public sealed class CmdSpyOptions
     /// <summary>Cap on in-memory retained events (the GUI's live list).</summary>
     public int MaxInMemoryEvents { get; set; } = 10_000;
 
+    /// <summary>Global cap on target-process captures admitted in one-minute windows.</summary>
+    public int MaxCapturedEventsPerMinute { get; set; } = 600;
+
+    /// <summary>Per Windows session cap on target-process captures admitted in one-minute windows.</summary>
+    public int MaxCapturedEventsPerSessionPerMinute { get; set; } = 300;
+
     /// <summary>
     /// How long a captured popup is tracked for child-process attribution and
     /// exit/lifetime after it is first seen. Entries older than this that were
@@ -66,6 +72,47 @@ public sealed class CmdSpyOptions
 
     /// <summary>Upper bound on descendants (children, grandchildren...) recorded per popup.</summary>
     public int MaxDescendantsPerEvent { get; set; } = 200;
+
+    /// <summary>Upper bound on descendant process IDs tracked across all active popups.</summary>
+    public int MaxTrackedDescendantProcesses { get; set; } = 20_000;
+
+    /// <summary>Upper bound on distinct network endpoints retained and persisted per popup.</summary>
+    public int MaxNetworkConnectionsPerEvent { get; set; } = 200;
+
+    /// <summary>Maximum number of distinct investigation passes waiting for the background worker.</summary>
+    public int MaxPendingInvestigations { get; set; } = 256;
+
+    /// <summary>
+    /// Soft elapsed-time budget for one investigation. A step already in progress is allowed to
+    /// finish, but additional enrichment is skipped after this budget is exhausted.
+    /// </summary>
+    public TimeSpan MaxInvestigationDuration { get; set; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>Largest executable that background investigation will hash in full.</summary>
+    public long MaxHashedFileBytes { get; set; } = 64L * 1024 * 1024;
+
+    /// <summary>Maximum cumulative file bytes hashed during one investigation pass.</summary>
+    public long MaxHashedBytesPerInvestigation { get; set; } = 128L * 1024 * 1024;
+
+    /// <summary>Maximum file-verification results retained by the investigator.</summary>
+    public int MaxSignatureCacheEntries { get; set; } = 4_096;
+
+    // ---- Log resource limits ----------------------------------------------
+
+    /// <summary>Maximum bytes in either daily JSON-lines or human-readable log file.</summary>
+    public long MaxLogFileBytes { get; set; } = 64L * 1024 * 1024;
+
+    /// <summary>Maximum encoded bytes in one JSON-lines record or human-readable block.</summary>
+    public int MaxLogRecordBytes { get; set; } = 1024 * 1024;
+
+    /// <summary>Maximum aggregate bytes retained across dated JSON-lines and text logs.</summary>
+    public long MaxLogDirectoryBytes { get; set; } = 512L * 1024 * 1024;
+
+    /// <summary>Number of dated CMD-spy log files retained, measured in days.</summary>
+    public int LogRetentionDays { get; set; } = 14;
+
+    /// <summary>Writes stop before free space on the log volume falls below this reserve.</summary>
+    public long MinLogVolumeFreeBytes { get; set; } = 512L * 1024 * 1024;
 
     // ---- Network ----------------------------------------------------------
 
