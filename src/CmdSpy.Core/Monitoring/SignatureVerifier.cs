@@ -27,7 +27,19 @@ public sealed class SignatureVerifier
     /// <summary>Verifies <paramref name="path"/>; the result is a copy carrying the given role/PID.</summary>
     public SignatureInfo Verify(string path, string role, int? processId = null)
     {
-        var info = VerifyCached(path);
+        if (!ProcessImageResolver.TryGetLocalFixedPath(path, out var localPath))
+        {
+            return new SignatureInfo
+            {
+                Path = path,
+                Role = role,
+                ProcessId = processId,
+                Status = SignatureStatus.NotFound,
+                Detail = "Only files on local fixed volumes can be inspected."
+            };
+        }
+
+        var info = VerifyCached(localPath);
         var copy = Clone(info);
         copy.Role = role;
         copy.ProcessId = processId;
@@ -37,11 +49,11 @@ public sealed class SignatureVerifier
     /// <summary>Company and product names from a file's version resource.</summary>
     public static (string? Company, string? Product, string? Description) ReadVersionInfo(string? path)
     {
-        if (string.IsNullOrWhiteSpace(path)) return (null, null, null);
+        if (!ProcessImageResolver.TryGetLocalFixedPath(path, out var localPath)) return (null, null, null);
         try
         {
-            if (!File.Exists(path)) return (null, null, null);
-            var v = FileVersionInfo.GetVersionInfo(path);
+            if (!File.Exists(localPath)) return (null, null, null);
+            var v = FileVersionInfo.GetVersionInfo(localPath);
             return (Clean(v.CompanyName), Clean(v.ProductName), Clean(v.FileDescription));
         }
         catch

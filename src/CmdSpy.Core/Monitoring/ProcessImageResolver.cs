@@ -33,6 +33,9 @@ public static class ProcessImageResolver
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern uint QueryDosDeviceW(string deviceName, StringBuilder targetPath, int max);
 
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern DriveType GetDriveTypeW(string rootPathName);
+
     private static readonly Lazy<List<(string Device, string Drive)>> DeviceMap = new(BuildDeviceMap);
 
     /// <summary>Full image path and start time of a running process, or nulls.</summary>
@@ -110,17 +113,20 @@ public static class ProcessImageResolver
 
         if (IsRooted(first))
         {
-            if (FileExists(first)) return first;
-            if (!first.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && FileExists(first + ".exe")) return first + ".exe";
+            if (!TryGetLocalFixedPath(first, out var local)) return null;
+            if (TryGetExistingLocalFixedPath(local, out var existing)) return existing;
+            if (!local.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) &&
+                TryGetExistingLocalFixedPath(local + ".exe", out existing)) return existing;
 
             // Unquoted path containing spaces: C:\Program Files\x\y.exe --arg
             var raw = commandLine.TrimStart();
             for (int end = raw.IndexOf(' '); end > 0; end = raw.IndexOf(' ', end + 1))
             {
                 var candidate = raw[..end];
-                if (candidate.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && FileExists(candidate)) return candidate;
+                if (candidate.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) &&
+                    TryGetExistingLocalFixedPath(candidate, out existing)) return existing;
             }
-            return first;
+            return local;
         }
         return FindByName(first);
     }
@@ -150,7 +156,7 @@ public static class ProcessImageResolver
             try
             {
                 var full = Path.Combine(dir.Trim('"'), file);
-                if (FileExists(full)) return full;
+                if (TryGetExistingLocalFixedPath(full, out var existing)) return existing;
             }
             catch (ArgumentException)
             {
@@ -165,19 +171,23 @@ public static class ProcessImageResolver
     /// </summary>
     public static string? Resolve(int processId, string? knownPath, string? name, string? commandLine, DateTimeOffset? startedUtc)
     {
-        var known = NormalizeKernelPath(knownPath);
-        if (!string.IsNullOrEmpty(known) && IsRooted(known) && FileExists(known)) return known;
+        string? known = null;
+        if (TryGetLocalFixedPath(knownPath, out var localKnown))
+        {
+            known = localKnown;
+            if (TryGetExistingLocalFixedPath(known, out var existing)) return existing;
+        }
 
         var (livePath, liveStart) = TryQueryLive(processId);
         if (livePath is not null)
         {
             bool sameIncarnation = startedUtc is null || startedUtc == DateTimeOffset.MinValue || liveStart is null ||
                                    (liveStart.Value - startedUtc.Value).Duration() <= ProcessCache.Skew;
-            if (sameIncarnation) return NormalizeKernelPath(livePath);
+            if (sameIncarnation && TryGetLocalFixedPath(livePath, out var localLive)) return localLive;
         }
 
         var fromCommand = FromCommandLine(commandLine);
-        if (fromCommand is not null && IsRooted(fromCommand) && FileExists(fromCommand)) return fromCommand;
+        if (TryGetExistingLocalFixedPath(fromCommand, out var existingCommand)) return existingCommand;
 
         var byName = FindByName(name ?? known);
         if (byName is not null) return byName;
@@ -189,11 +199,48 @@ public static class ProcessImageResolver
         !string.IsNullOrEmpty(path) && path.Length > 2 &&
         ((path[1] == ':' && (path[2] == '\\' || path[2] == '/')) || path.StartsWith(@"\\", StringComparison.Ordinal));
 
-    private static bool FileExists(string path)
+    /// <summary>
+    /// Returns true only for canonical DOS paths on local fixed volumes. The
+    /// namespace and drive checks happen before any operation on the target.
+    /// </summary>
+    public static bool IsLocalFixedPath(string? path) => TryGetLocalFixedPath(path, out _);
+
+    internal static bool TryGetLocalFixedPath(string? path, out string localPath)
     {
-        try { return File.Exists(path); }
+        localPath = "";
+        if (!OperatingSystem.IsWindows()) return false;
+
+        var normalized = NormalizeKernelPath(path);
+        if (!IsDriveAbsolute(normalized)) return false;
+
+        try
+        {
+            var full = Path.GetFullPath(normalized!);
+            if (!IsDriveAbsolute(full)) return false;
+
+            var root = $"{char.ToUpperInvariant(full[0])}:\\";
+            if (GetDriveTypeW(root) != DriveType.Fixed) return false;
+
+            localPath = full;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool TryGetExistingLocalFixedPath(string? path, out string localPath)
+    {
+        if (!TryGetLocalFixedPath(path, out localPath)) return false;
+        try { return File.Exists(localPath); }
         catch { return false; }
     }
+
+    private static bool IsDriveAbsolute(string? path) =>
+        !string.IsNullOrEmpty(path) && path.Length > 2 &&
+        ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
+        path[1] == ':' && (path[2] == '\\' || path[2] == '/');
 
     private static List<(string, string)> BuildDeviceMap()
     {

@@ -194,6 +194,21 @@ public class WindowsIntegrationTests : IDisposable
     // --------------------------------------------------------- signatures --
 
     [WindowsFact]
+    public void EnrichmentPathsRejectNetworkAndDeviceNamespaces()
+    {
+        Assert.False(ProcessImageResolver.IsLocalFixedPath(@"\\attacker.invalid\share\tool.exe"));
+        Assert.False(ProcessImageResolver.IsLocalFixedPath(@"\\?\UNC\attacker.invalid\share\tool.exe"));
+        Assert.False(ProcessImageResolver.IsLocalFixedPath(@"\\.\GLOBALROOT\Device\Mup\attacker.invalid\share\tool.exe"));
+        Assert.False(ProcessImageResolver.IsLocalFixedPath(@"\??\UNC\attacker.invalid\share\tool.exe"));
+    }
+
+    [WindowsFact]
+    public void EnrichmentPathsAllowLocalFixedVolumeExecutables()
+    {
+        Assert.True(ProcessImageResolver.IsLocalFixedPath(SystemExe("cmd.exe")));
+    }
+
+    [WindowsFact]
     public void WindowsBinariesVerifyAsMicrosoftSigned()
     {
         var info = new SignatureVerifier().Verify(SystemExe("cmd.exe"), "test");

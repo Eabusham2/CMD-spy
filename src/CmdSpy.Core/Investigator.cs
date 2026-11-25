@@ -511,7 +511,8 @@ public sealed class Investigator : IDisposable
         var targets = new List<(string Path, string Role, int? Pid)>();
         void Add(string? path, string role, int? pid)
         {
-            if (ProcessImageResolver.IsRooted(path)) targets.Add((path!, role, pid));
+            if (ProcessImageResolver.TryGetLocalFixedPath(path, out var localPath))
+                targets.Add((localPath, role, pid));
         }
 
         Add(inv.ResolvedImagePath, "this process", s.ProcessId);
