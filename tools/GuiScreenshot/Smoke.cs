@@ -1,7 +1,9 @@
 using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
 using System.Security.Principal;
-using System.Text;
+using System.Xml.Linq;
 
 namespace GuiScreenshot;
 
@@ -29,8 +31,14 @@ internal static class Smoke
         catch (Exception ex) { Check("Boot service smoke test ran", false, ex.ToString()); }
         finally { Sc("stop CmdSpy"); Sc("delete CmdSpy"); }
 
-        try { LogonTask(appExe); }
-        catch (Exception ex) { Check("Logon task smoke test ran", false, ex.ToString()); }
+        try { ProtectedTaskXml(); }
+        catch (Exception ex) { Check("Protected task XML smoke test ran", false, ex.ToString()); }
+
+        foreach (var forceCompatibility in new[] { false, true })
+        {
+            try { LogonTask(appExe, forceCompatibility); }
+            catch (Exception ex) { Check($"Logon task smoke test ran ({(forceCompatibility ? "schtasks fallback" : "COM")})", false, ex.ToString()); }
+        }
 
         Log("");
         Log($"{Results.Count(r => r.Pass)}/{Results.Count} checks passed");
@@ -94,7 +102,42 @@ internal static class Smoke
 
     // --------------------------------------------------------- logon task --
 
-    private static void LogonTask(string appExe)
+    private static void ProtectedTaskXml()
+    {
+        var fileType = typeof(CmdSpy.App.MainForm).Assembly.GetType("CmdSpy.App.StartupTaskXmlFile")
+            ?? throw new InvalidOperationException("This build has no protected task XML file helper.");
+        const string xml = "<?xml version=\"1.0\" encoding=\"UTF-16\"?><test>task XML — same content</test>";
+        var file = (IDisposable)fileType.GetMethod("Create")!.Invoke(null, new object[] { xml })!;
+        var path = (string)fileType.GetProperty("FilePath")!.GetValue(file)!;
+        try
+        {
+            Check("Compatibility XML can be read intact by a second reader", File.ReadAllText(path) == xml, "UTF-16 round trip");
+            Check("Compatibility XML uses the protected system directory", Path.GetDirectoryName(path) == Environment.SystemDirectory, path);
+            var security = new FileInfo(path).GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner);
+            var administrators = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+            var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+            Check("Compatibility XML is owned by Administrators, not the unelevated user",
+                administrators.Equals(security.GetOwner(typeof(SecurityIdentifier))), "owner SID");
+            var rules = security.GetAccessRules(true, true, typeof(SecurityIdentifier)).Cast<FileSystemAccessRule>().ToArray();
+            Check("Compatibility XML has a protected Administrators/SYSTEM-only DACL",
+                security.AreAccessRulesProtected && rules.Length == 2 &&
+                rules.All(rule => rule.AccessControlType == AccessControlType.Allow && !rule.IsInherited &&
+                    (rule.IdentityReference.Equals(administrators) || rule.IdentityReference.Equals(system)) &&
+                    (rule.FileSystemRights & FileSystemRights.FullControl) == FileSystemRights.FullControl), "explicit ACL at creation");
+            bool writeBlocked = false;
+            try { using var writer = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite); }
+            catch (IOException) { writeBlocked = true; }
+            catch (UnauthorizedAccessException) { writeBlocked = true; }
+            Check("Compatibility XML stays locked against writes while schtasks reads it", writeBlocked, "held read handle denies write sharing");
+        }
+        finally
+        {
+            file.Dispose();
+            Check("Compatibility XML is removed after use", !File.Exists(path), path);
+        }
+    }
+
+    private static void LogonTask(string appExe, bool forceCompatibility)
     {
         var definition = Type.GetType("CmdSpy.Core.StartupTaskDefinition, CmdSpy.Core")
             ?? throw new InvalidOperationException("This build has no StartupTaskDefinition.");
@@ -103,13 +146,47 @@ internal static class Smoke
         using (var identity = WindowsIdentity.GetCurrent()) user = identity.Name;
         var xml = (string)definition.GetMethod("BuildXml")!.Invoke(null, new object[] { appExe, user })!;
 
-        var xmlPath = Path.Combine(Path.GetTempPath(), $"cmdspy-smoke-task-{Guid.NewGuid():N}.xml");
-        File.WriteAllText(xmlPath, xml, Encoding.Unicode);
-        var create = Schtasks($"/Create /TN \"{taskName}\" /XML \"{xmlPath}\" /F");
-        Check("Logon task accepted by Task Scheduler", create.Code == 0, create.Output.Trim());
+        var startupManager = typeof(CmdSpy.App.MainForm).Assembly.GetType("CmdSpy.App.StartupManager")
+            ?? throw new InvalidOperationException("This build has no StartupManager.");
+        var register = startupManager.GetMethod("RegisterTask", BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new InvalidOperationException("This build has no task registration entry point.");
+        var registerCom = startupManager.GetMethod("RegisterTaskWithCom", BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new InvalidOperationException("This build has no direct COM task registration entry point.");
+        var mode = forceCompatibility ? "schtasks fallback after COM failure" : "COM";
+        Log($"Testing logon task registration through {mode}.");
         try
         {
+            Action<string, string> comRegistration = (definitionXml, identityName) =>
+            {
+                if (forceCompatibility)
+                    throw new COMException("Intentional COM failure for the compatibility smoke test.");
+                try
+                {
+                    registerCom.Invoke(null, new object[] { definitionXml, identityName });
+                }
+                catch (TargetInvocationException ex) when (ex.InnerException is not null)
+                {
+                    var cause = ex.InnerException!;
+                    Log($"Direct COM registration failed ({cause.GetType().FullName}, HRESULT 0x{cause.HResult:X8}): {cause}");
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(cause).Throw();
+                }
+            };
+            var usedCompatibility = (bool)register.Invoke(null, new object?[] { xml, user, comRegistration })!;
+            Check($"Logon task registers through {mode}", usedCompatibility == forceCompatibility,
+                usedCompatibility ? "schtasks compatibility path" : "direct COM path");
             var registered = Schtasks($"/Query /TN \"{taskName}\" /XML").Output;
+            var task = XDocument.Parse(registered);
+            XNamespace ns = "http://schemas.microsoft.com/windows/2004/02/mit/task";
+            var principal = task.Root?.Element(ns + "Principals")?.Element(ns + "Principal");
+            using var identity = WindowsIdentity.GetCurrent();
+            var registeredUser = principal?.Element(ns + "UserId")?.Value;
+            Check("Task keeps the current user's interactive identity",
+                (string.Equals(registeredUser, user, StringComparison.OrdinalIgnoreCase) || registeredUser == identity.User?.Value) &&
+                principal?.Element(ns + "LogonType")?.Value == "InteractiveToken", registeredUser ?? "missing principal");
+            var action = task.Root?.Element(ns + "Actions")?.Element(ns + "Exec");
+            Check("Task keeps the executable and tray/startup arguments",
+                string.Equals(action?.Element(ns + "Command")?.Value, appExe, StringComparison.OrdinalIgnoreCase) &&
+                action?.Element(ns + "Arguments")?.Value == "--tray --startup", mode);
             Check("Task runs with highest privileges (elevated, no UAC prompt)", registered.Contains("<RunLevel>HighestAvailable</RunLevel>"), "RunLevel");
             Check("Task runs at high priority", registered.Contains("<Priority>1</Priority>"), "Priority 1 = HIGH_PRIORITY_CLASS");
             Check("Task never starts a second copy", registered.Contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"), "IgnoreNew");
@@ -148,7 +225,6 @@ internal static class Smoke
             Schtasks($"/End /TN \"{taskName}\"");
             var delete = Schtasks($"/Delete /TN \"{taskName}\" /F");
             Check("Logon task removed again", delete.Code == 0, delete.Output.Trim());
-            try { File.Delete(xmlPath); } catch { }
         }
     }
 

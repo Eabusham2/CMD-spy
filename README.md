@@ -170,6 +170,12 @@ Each can also be switched on or off on its own from the **Startup ▾** menu (or
 `%ProgramFiles%\CmdSpy`. Releases are precompiled (ReadyToRun) so CMD-spy starts
 quickly, and capture begins before the start-up process snapshot finishes.
 
+The logon task uses the Windows Task Scheduler API first. If that registration
+fails, CMD-spy keeps the `schtasks` compatibility method and supplies the same
+task definition through a protected temporary XML file. Both methods preserve
+the current user's account, elevation, priority and triggers; a successful
+registration is not repeated through the other method.
+
 ## Tray mode and single instance
 
 - CMD-spy shows an icon in the notification area. **Closing the window keeps it
