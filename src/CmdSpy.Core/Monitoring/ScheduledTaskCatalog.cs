@@ -265,6 +265,12 @@ public sealed class ScheduledTaskCatalog
                 var actionFile = CommandLineTokenizer.FileNameOf(actionPath);
                 bool samePath = imagePath is not null && ProcessImageResolver.IsRooted(actionPath) &&
                                 actionPath.Equals(processPath, StringComparison.OrdinalIgnoreCase);
+                // A bare program name ("powershell.exe", "cmd") is found through the
+                // Windows search path, so it names the process's own image whenever that
+                // image has this file name. Like a full path, it counts as exact only with
+                // the image reported for the process itself and identical arguments.
+                bool sameBareProgram = imagePath is not null && IsBareProgramName(actionPath) &&
+                                       SameProgramFile(actionFile, processFile);
                 int score;
                 if (samePath)
                     score = 50;
@@ -275,7 +281,7 @@ public sealed class ScheduledTaskCatalog
 
                 var rawArguments = Expand(action.Arguments ?? "");
                 var args = NormalizeSpace(rawArguments);
-                if (samePath && ArgumentsMatch(processTokens, commandLine ?? "", rawArguments, actionFile))
+                if ((samePath || sameBareProgram) && ArgumentsMatch(processTokens, commandLine ?? "", rawArguments, actionFile))
                     score = ExactActionScore;
                 else if (args.Length > 0 && normalizedCommand.Length > 0)
                 {
@@ -298,6 +304,15 @@ public sealed class ScheduledTaskCatalog
         try { return Environment.ExpandEnvironmentVariables(value); }
         catch { return value; }
     }
+
+    private static bool IsBareProgramName(string path) =>
+        path.Length > 0 && path.IndexOfAny(new[] { '\\', '/', ':' }) < 0;
+
+    /// <summary>Same file name; Windows adds ".exe" to a bare name that has no extension.</summary>
+    private static bool SameProgramFile(string actionFile, string processFile) =>
+        actionFile.Equals(processFile, StringComparison.OrdinalIgnoreCase) ||
+        (Path.GetExtension(actionFile).Length == 0 &&
+         (actionFile + ".exe").Equals(processFile, StringComparison.OrdinalIgnoreCase));
 
     private static string NormalizeExecutablePath(string path) =>
         (ProcessImageResolver.NormalizeKernelPath(path) ?? "").Replace('/', '\\');

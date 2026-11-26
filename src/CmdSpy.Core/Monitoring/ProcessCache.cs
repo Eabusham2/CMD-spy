@@ -127,6 +127,15 @@ public sealed class ProcessCache
                         known = true;
                         break;
                     }
+                    // A short-lived process may have exited (no proof possible) before
+                    // the snapshot arrives. Its snapshot copy is still the start already
+                    // recorded live: skip it rather than keep a second "running" record,
+                    // and copy nothing from it.
+                    if (existing.Source != "snapshot" && SameStartWithoutProof(record, existing))
+                    {
+                        known = true;
+                        break;
+                    }
                 }
                 if (known) continue;
                 InsertSorted(list, record);
@@ -165,6 +174,18 @@ public sealed class ProcessCache
                 list.RemoveAt(seeded);
                 _count--;
             }
+            else
+            {
+                // Without proof (it may already have exited), a snapshot copy of this
+                // very start would otherwise stay "running" forever beside it: drop
+                // that copy, but take nothing from it.
+                int duplicate = list.FindIndex(r => r.Source == "snapshot" && SameStartWithoutProof(r, record));
+                if (duplicate >= 0)
+                {
+                    list.RemoveAt(duplicate);
+                    _count--;
+                }
+            }
             InsertSorted(list, record);
             _count++;
             if (++_writesSincePrune >= 512)
@@ -192,9 +213,33 @@ public sealed class ProcessCache
                SameCreationTime(snapshot.StartTimeUtc, actual);
     }
 
+    /// <summary>
+    /// How far a process's creation time (taken from the coarse system clock, whose
+    /// tick can be 15.6 ms) can trail the precise timestamp of its own start event.
+    /// </summary>
+    private static readonly TimeSpan SameStartWindow = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>
+    /// A snapshot copy and a live record that describe the same start although the
+    /// process can no longer be checked: compatible identity, and a creation time at
+    /// most one clock tick before the live start. Another process would have to start,
+    /// exit and give up its PID within that tick. This only removes a duplicate;
+    /// identity is never copied between records without creation-time proof.
+    /// </summary>
+    private static bool SameStartWithoutProof(ProcessRecord snapshot, ProcessRecord observed)
+    {
+        if (snapshot.ExitTimeUtc is not null || observed.StartTimeIsEstimated ||
+            snapshot.StartTimeUtc == DateTimeOffset.MinValue || observed.StartTimeUtc == DateTimeOffset.MinValue)
+            return false;
+        var lead = observed.StartTimeUtc - snapshot.StartTimeUtc;
+        return lead >= TimeSpan.Zero && lead <= SameStartWindow && CompatibleIdentity(snapshot, observed);
+    }
+
+    // WMI's CreationDate has microsecond precision; whether it truncates or rounds
+    // the 100 ns creation time, the same process differs by less than 1 microsecond.
     private static bool SameCreationTime(DateTimeOffset left, DateTimeOffset right) =>
         left != DateTimeOffset.MinValue && right != DateTimeOffset.MinValue &&
-        left.UtcTicks / 10 == right.UtcTicks / 10; // WMI CreationDate has microsecond precision.
+        Math.Abs(left.UtcTicks - right.UtcTicks) < 10;
 
     private static bool CompatibleIdentity(ProcessRecord left, ProcessRecord right)
     {

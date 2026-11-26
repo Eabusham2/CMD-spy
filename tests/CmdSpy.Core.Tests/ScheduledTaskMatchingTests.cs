@@ -164,6 +164,49 @@ public sealed class ScheduledTaskMatchingTests : IDisposable
         Assert.Contains("disabled now", result.Evidence);
     }
 
+    [Fact]
+    public void BareProgramNameWithIdenticalArgumentsIsAnExactAction()
+    {
+        // Many tasks (malicious ones included) name just "powershell.exe"; Windows finds
+        // it on the search path, so the process's own image carries that file name.
+        const string powershell = @"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        var tasks = new[]
+        {
+            Task(@"\Updater", "powershell.exe", @"-w hidden -c iex (gc C:\x.ps1)"),
+            Task(@"\Vendor", powershell, @"-NoProfile -File C:\vendor\update.ps1")
+        };
+        var process = Process(powershell, @"powershell.exe -w hidden -c iex (gc C:\x.ps1)");
+        var matches = ScheduledTaskCatalog.Match(tasks, process.ImagePath, process.CommandLine);
+
+        Assert.Equal(ScheduledTaskCatalog.ExactActionScore, matches[0].Score);
+        var result = Correlate(tasks, process);
+        Assert.Equal(@"\Updater", result!.TaskPath);
+        Assert.Equal(TaskConfidence.Likely, result.Confidence);
+        Assert.Contains("exact command", result.Evidence);
+    }
+
+    [Theory]
+    [InlineData("cmd", Cmd, "cmd /c echo hello", true)]                  // Windows adds .exe
+    [InlineData("CMD.EXE", Cmd, "CMD.EXE /c echo hello", true)]
+    [InlineData("pwsh.exe", Cmd, "pwsh.exe /c echo hello", false)]       // another program
+    [InlineData("cmd.exe", null, "cmd.exe /c echo hello", false)]        // image unknown: command line alone
+    [InlineData(@"Apps\cmd.exe", Cmd, @"Apps\cmd.exe /c echo hello", false)] // relative path, not a bare name
+    public void BareProgramNameNeedsTheProcessImageAndItsFileName(string command, string? image, string observed, bool exact)
+    {
+        var matches = ScheduledTaskCatalog.Match(new[] { Task(@"\Task", command, "/c echo hello") }, image, observed);
+        Assert.Equal(exact, matches.Any(match => match.Score == ScheduledTaskCatalog.ExactActionScore));
+    }
+
+    [Fact]
+    public void EqualBareActionsFromDifferentTasksStayAmbiguous()
+    {
+        var tasks = new[] { Task(@"\First", "cmd.exe", "/c echo hello"), Task(@"\Second", "cmd.exe", "/c echo hello") };
+        var process = Process(Cmd, "cmd.exe /c echo hello");
+
+        Assert.Null(ScheduledTaskCorrelator.UniqueBestMatch(ScheduledTaskCatalog.Match(tasks, Cmd, process.CommandLine), 50));
+        Assert.Equal("", Correlate(tasks, process)!.TaskPath);
+    }
+
     private static ScheduledTaskInfo Task(string path, string command, string arguments, bool enabled = true) => new()
     {
         Path = path, Enabled = enabled,

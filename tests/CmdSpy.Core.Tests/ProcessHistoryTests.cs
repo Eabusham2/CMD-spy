@@ -162,7 +162,7 @@ public class ProcessHistoryTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void MissingCreationProofOrEstimatedEventTimeKeepsBothRecords(bool estimated)
+    public void MissingCreationProofNeverCopiesIdentity_AndEstimatedEventTimeKeepsBothRecords(bool estimated)
     {
         int lookups = 0;
         var cache = new ProcessCache(_ => { lookups++; return estimated ? T0 : (DateTimeOffset?)null; });
@@ -170,9 +170,45 @@ public class ProcessHistoryTests
         var live = cache.RecordStart(Start(900, 100, "cmd.exe", T0.AddMilliseconds(4),
             source: "WMI", estimated: estimated));
 
-        Assert.Equal(2, cache.Count);
+        // Without proof, the snapshot copy of this same start (one clock tick earlier)
+        // is dropped instead of staying "running" beside it, but none of its identity
+        // is copied. An estimated event time can't place the start at all: both stay.
+        Assert.Equal(estimated ? 2 : 1, cache.Count);
         Assert.Null(live.ImagePath);
+        Assert.Null(live.CommandLine);
         Assert.Equal(estimated ? 0 : 1, lookups);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ShortLivedProcessAtTheSnapshotLeavesNoSecondRunningRecord(bool snapshotFirst)
+    {
+        // At boot the snapshot is slow: a popup can start, be listed, exit and be
+        // gone (nothing left to query) on either side of the snapshot being stored.
+        var created = T0.AddMilliseconds(-3);
+        var cache = new ProcessCache(_ => null);
+        if (snapshotFirst) cache.Seed(new[] { Snapshot(900, created) });
+        var live = cache.RecordStart(Start(900, 100, "cmd.exe", T0, source: "WMI"));
+        cache.RecordStop(Stop(900, T0.AddMilliseconds(20)));
+        if (!snapshotFirst) cache.Seed(new[] { Snapshot(900, created) });
+
+        Assert.Equal(1, cache.Count);
+        var only = cache.TryGet(900)!;
+        Assert.Equal(T0, only.StartTimeUtc);
+        Assert.Equal(T0.AddMilliseconds(20), only.ExitTimeUtc);
+        Assert.NotNull(cache.TryGetUnambiguousIncarnation(900, T0));
+        Assert.Null(live.CommandLine);                      // nothing copied without proof
+    }
+
+    [Fact]
+    public void SnapshotMoreThanAClockTickBeforeTheLiveStartIsKeptWithoutProof()
+    {
+        var cache = new ProcessCache(_ => null);
+        cache.Seed(new[] { Snapshot(900, T0.AddMilliseconds(-200)) });
+        cache.RecordStart(Start(900, 100, "cmd.exe", T0, "cmd.exe /c echo hi", @"C:\Windows\System32\cmd.exe"));
+
+        Assert.Equal(2, cache.Count);
     }
 
     [Fact]

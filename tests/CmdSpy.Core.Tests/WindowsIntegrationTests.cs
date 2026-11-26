@@ -248,6 +248,46 @@ public class WindowsIntegrationTests : IDisposable
     }
 
     [WindowsFact]
+    public void SnapshotAndLiveCreationTimesProveTheSameProcess()
+    {
+        // The start-up snapshot (WMI CreationDate, microseconds) and the live check
+        // (GetProcessTimes) must agree, or a snapshot copy can never be proven to be
+        // the process whose start event arrives later.
+        using var ping = StartHidden(SystemExe("PING.EXE"), "-n 30 127.0.0.1");
+        try
+        {
+            var snapshot = ProcessSnapshot.SnapshotAll().FirstOrDefault(r => r.ProcessId == ping.Id);
+            var (_, live) = ProcessImageResolver.TryQueryLive(ping.Id);
+            Assert.NotNull(snapshot);
+            Assert.NotNull(live);
+            long difference = live!.Value.UtcTicks - snapshot!.StartTimeUtc.UtcTicks;
+            _output.WriteLine($"WMI CreationDate {snapshot.StartTimeUtc:O} | GetProcessTimes {live.Value:O} | difference {difference} x 100 ns");
+            Assert.InRange(difference, -9, 9);
+
+            // With that proof, a start event without image or command line (as WMI
+            // reports it) takes over the snapshot copy and keeps its details.
+            var cache = new ProcessCache();
+            cache.Seed(new[] { snapshot });
+            var started = cache.RecordStart(new ProcessStartedEventArgs
+            {
+                ProcessId = ping.Id,
+                ParentProcessId = snapshot.ParentProcessId,
+                ProcessName = snapshot.Name,
+                TimestampUtc = live.Value.AddMilliseconds(1),
+                SessionId = snapshot.SessionId,
+                Source = "WMI"
+            });
+            Assert.Equal(1, cache.Count);
+            Assert.Equal(snapshot.CommandLine, started.CommandLine);
+            Assert.Equal(snapshot.ImagePath, started.ImagePath);
+        }
+        finally
+        {
+            try { ping.Kill(); } catch { }
+        }
+    }
+
+    [WindowsFact]
     public void EventLogSourcesCanBeQueried()
     {
         var status = new WindowsEventHistory().GetSourceStatus(refresh: true);
